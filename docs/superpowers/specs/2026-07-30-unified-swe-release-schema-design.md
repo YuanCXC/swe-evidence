@@ -22,7 +22,7 @@ unified_swe_dataset_v1/
 - 模型输入与离线监督严格分区。
 - train、validation、benchmark 使用完全相同的物理 Schema。
 - 三个任务文件在发布前完成物理切分，不依赖运行时随机划分。
-- 完整代码只保存在 `repository_corpus.parquet`，每个文件的正文只保存一次。
+- 完整代码只保存在 `repository_corpus.parquet`，每个唯一文件版本的正文只保存一次。
 - 任务文件通过稳定的 `evidence_id` 引用代码。
 
 ## 2. 文件职责
@@ -32,7 +32,7 @@ unified_swe_dataset_v1/
 | `train.parquet` | 一个可训练的统一任务 | 参数训练、行为模仿、弱监督预训练 |
 | `validation.parquet` | 一个冻结的验证任务 | 调参、早停、阈值选择、回归验证 |
 | `benchmark.parquet` | 一个正式评测任务 | 证据检索、充分性判断、代码修复评测 |
-| `repository_corpus.parquet` | 一个仓库文件 | 保存完整文件正文及嵌套的 Evidence Unit |
+| `repository_corpus.parquet` | 一个唯一文件版本 | 保存正文、快照成员关系及嵌套 Evidence Unit |
 | `manifest.json` | 整个发布版本的元数据 | Schema、来源、哈希、统计和审计 |
 
 ## 3. 公共任务 Schema
@@ -377,15 +377,18 @@ unified_swe_dataset_v1/
 
 ### 8.1 行粒度
 
-每行表示一个修复前仓库快照中的文件。文件正文只保存一次，类、函数、方法和代码块以嵌套的行号范围表示。
+每行表示一个唯一文件版本。唯一键为 `repo + path + blob_oid`：同一仓库、同一路径、同一内容只保存一行，使用该版本的全部快照记录在 `snapshot_ids` 中。
 
 ```json
 {
-  "file_id": "file_django_abc123_query_py",
-  "snapshot_id": "snapshot_django_abc123",
+  "file_version_id": "fv_django_query_7a80d963",
   "repo": "django/django",
-  "commit": "abc123",
   "path": "django/db/models/query.py",
+  "blob_oid": "4d5c6e7f8a9b",
+  "snapshot_ids": [
+    "snapshot_django_abc123",
+    "snapshot_django_def456"
+  ],
   "language": "python",
   "content": "class QuerySet:",
   "content_sha256": "7a80d963",
@@ -399,7 +402,7 @@ unified_swe_dataset_v1/
   },
   "evidence_units": [
     {
-      "evidence_id": "ev_django_abc123_query_file",
+      "evidence_id": "ev_django_query_7a80d963_file",
       "unit_type": "file",
       "symbol": null,
       "qualified_name": null,
@@ -422,11 +425,11 @@ unified_swe_dataset_v1/
 
 | 字段 | 类型 | 必填 | 含义 |
 |------|------|------|------|
-| `file_id` | string | 是 | 当前快照下的唯一文件 ID |
-| `snapshot_id` | string | 是 | 所属修复前仓库快照 |
+| `file_version_id` | string | 是 | 唯一文件版本 ID |
 | `repo` | string | 是 | 规范化仓库名 |
-| `commit` | string | 是 | 已解析 commit |
 | `path` | string | 是 | 仓库内相对路径 |
+| `blob_oid` | string | 是 | Git tree 中的文件内容对象 ID |
+| `snapshot_ids` | list\<string> | 是 | 使用此文件版本的全部快照 ID |
 | `language` | string | 是 | 编程语言或文档类型 |
 | `content` | string | 否 | 完整文件正文 |
 | `content_sha256` | string | 是 | 文件内容哈希 |
@@ -436,12 +439,16 @@ unified_swe_dataset_v1/
 | `imports` | list\<struct> | 是 | 文件的静态依赖 |
 | `extraction` | struct | 是 | 结构提取过程和状态 |
 
-唯一性：
+唯一性和成员关系：
 
-- `file_id` 在整个 corpus 中唯一。
-- `snapshot_id + path` 在整个 corpus 中唯一。
-- 同一路径在不同 commit 下对应不同的 `file_id`。
-- `content_sha256` 只描述正文，不承担文件身份。
+- `file_version_id` 在整个 corpus 中唯一。
+- `repo + path + blob_oid` 在整个 corpus 中唯一。
+- `file_version_id` 由 `repo + path + blob_oid` 的稳定哈希生成。
+- `snapshot_ids` 必须经过排序和去重。
+- 展开所有 `snapshot_ids` 后，`snapshot_id + path` 必须唯一命中一个 `file_version_id`。
+- 同一路径内容变化时创建新的文件版本；内容恢复时重新关联已有版本。
+- 同一内容出现在不同路径或不同仓库时，不跨路径或仓库合并。
+- `content_sha256` 用于正文完整性校验，不单独承担文件版本身份。
 
 二进制文件可以保留路径和哈希，但 `content=null`、`attributes.searchable=false` 且 `evidence_units=[]`。
 
@@ -480,7 +487,7 @@ unit_content = file_content_lines[start_line - 1:end_line]
 
 每个可搜索文本文件必须生成且只生成一个 `unit_type=file` 的 Evidence Unit，范围为 `1..line_count`。解析成功时继续生成 class、function、method 和 doc_section。无法解析的可搜索文本文件按固定窗口降级生成 `code_block`，不得因为解析失败丢弃完整文件。
 
-所有监督标签统一引用 `evidence_id`：文件级标签指向 `unit_type=file`，细粒度标签指向对应的类、函数、方法、代码块或文档章节。`file_id` 只用于标识 corpus 的物理文件行，不作为监督标签 ID。
+所有监督标签统一引用 `evidence_id`：文件级标签指向 `unit_type=file`，细粒度标签指向对应的类、函数、方法、代码块或文档章节。`file_version_id` 只用于标识 corpus 的物理文件版本行，不作为监督标签 ID。
 
 ### 8.5 `imports`
 
@@ -489,9 +496,9 @@ unit_content = file_content_lines[start_line - 1:end_line]
 | 子字段 | 类型 | 含义 |
 |--------|------|------|
 | `module` | string | 源文件声明的模块或包 |
-| `resolved_path` | string | 当前 snapshot 中解析出的目标路径；未解析时为 null |
+| `declared_at_line` | int32 | import 声明所在行 |
 
-第一版不发布完整调用图、继承图或模型生成的关系边。
+`imports` 只保存由文件内容决定的声明，不保存 `resolved_path`。同一文件版本在不同 snapshot 中可能解析到不同目标，具体路径必须在加载任务快照时，根据该 snapshot 的文件成员关系确定。第一版不发布完整调用图、继承图或模型生成的关系边。
 
 ### 8.6 `extraction`
 
@@ -501,7 +508,7 @@ unit_content = file_content_lines[start_line - 1:end_line]
 | `parser_version` | string | 解析器版本 |
 | `status` | string | `success`、`fallback` 或 `unsupported` |
 
-任何任务只能访问自身 `snapshot_id` 对应、且 `attributes.searchable=true` 的文件和 Evidence Unit。训练加载器可以展开 `evidence_units` 形成函数级候选，但展开结果不是新的发布文件。
+任何任务只能访问 `snapshot_ids` 包含自身 `snapshot_id`、且 `attributes.searchable=true` 的文件版本和 Evidence Unit。训练加载器可以在内存中建立 `snapshot_id → file_version_id` 索引，并展开 `evidence_units` 形成函数级候选；索引和展开结果都不是新的发布文件。
 
 ## 9. `manifest.json`
 
@@ -514,6 +521,7 @@ unit_content = file_content_lines[start_line - 1:end_line]
 - 5 个发布文件的行数、大小和 SHA-256；
 - train、validation、benchmark 的任务数量；
 - strong、support、weak 的数量；
+- 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
 - 去重和身份冲突统计；
 - split 防泄漏审计；
 - 文件和 Evidence Unit 引用完整率；
@@ -528,7 +536,10 @@ unit_content = file_content_lines[start_line - 1:end_line]
 - 模型可见输入中包含 Gold；
 - validation 或 benchmark 存在轨迹；
 - benchmark 任务或派生任务进入 train；
-- corpus 中存在重复 `file_id` 或重复 `snapshot_id + path`；
+- corpus 中存在重复 `file_version_id` 或重复 `repo + path + blob_oid`；
+- 展开成员关系后，同一 `snapshot_id + path` 命中多个文件版本；
+- Git tree 中的 `path + blob_oid` 与 corpus 成员关系不一致；
+- `blob_oid`、文件正文和 `content_sha256` 校验不一致；
 - `evidence_id` 引用完整率低于 100%；
 - manifest 文件哈希与实际文件不一致；
 - 高严重度身份冲突进入任一任务文件；
@@ -545,5 +556,7 @@ unit_content = file_content_lines[start_line - 1:end_line]
 - 多来源通过 provenance、监督和轨迹合并到任务。
 - validation 和 benchmark 不包含轨迹。
 - benchmark 支持内部完整版和对外脱敏版。
-- `repository_corpus.parquet` 每行代表一个文件，Evidence Unit 作为嵌套行号范围保存。
-- 文件正文只保存一次，训练时按行号展开 Evidence Unit。
+- `repository_corpus.parquet` 每行代表一个唯一文件版本，唯一键为 `repo + path + blob_oid`。
+- 多个代码快照通过 `snapshot_ids` 共享相同文件版本，文件正文只保存一次。
+- Evidence Unit 作为嵌套行号范围保存，训练时按行号展开。
+- import 声明随文件版本保存，snapshot 相关的目标路径在加载时解析。
