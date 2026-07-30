@@ -1,0 +1,18 @@
+{
+  "assignment_path": "data/splits/split_assignments.jsonl",
+  "assignment_sha256": "73b8304ba7a1316adfd8645f339d4e546de3ceb3adba698aff25da1db9737ba9",
+  "eligible_instance_count": 22662,
+  "generated_at_utc": "2026-07-29T03:50:28.258679+00:00",
+  "input_path": "data/registry/master_instances.jsonl",
+  "input_sha256": "55ead07339e7d7043e6d9e846625780cf9b75811c8a7003ed10ae27ffff8af4a",
+  "quarantined_instance_count": 398,
+  "schema_version": "1.0",
+  "script_version": "1.0.0",
+  "seed": 20260729,
+  "split_ratios": {
+    "dev": 0.1,
+    "test_retrieval": 0.1,
+    "test_sufficiency": 0.1,
+    "train": 0.7
+  }
+}

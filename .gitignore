@@ -1,0 +1,22 @@
+# 敏感信息
+.env
+
+# 外部仓库 bare clone 缓存（5GB+，非项目源码）
+data/cache/
+
+# 超过 GitHub 100MB 单文件上限的大文件（后续单独处理）
+data/processed/normalized_instances.jsonl
+data/registry/master_instances.jsonl
+data/splits/train.jsonl
+data/raw/swebench/train-00000-of-00001.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE / 系统
+.DS_Store
+Thumbs.db

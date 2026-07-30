@@ -1,0 +1,17 @@
+{
+  "covered_instance_count": 2,
+  "failed_snapshot_count": 0,
+  "generated_at_utc": "2026-07-29T03:58:46.415200+00:00",
+  "git_version": "git version 2.52.0.windows.1",
+  "invalid_input_count": 0,
+  "manifest_sha256": "f03f413aa408a4516ad9ae120972723f3915e4c3b9e83f0c682436679ed5cb66",
+  "passed_snapshot_count": 2,
+  "read_only_worktrees": true,
+  "schema_version": "1.0",
+  "script_version": "1.0.0",
+  "selected_splits": [
+    "train"
+  ],
+  "status": "passed",
+  "unique_snapshot_task_count": 2
+}

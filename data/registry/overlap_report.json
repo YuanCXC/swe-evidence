@@ -1,0 +1,78 @@
+{
+  "conflict_count": 156,
+  "cross_source_group_count": 451,
+  "generated_at_utc": "2026-07-29T03:13:26.530951+00:00",
+  "group_size_distribution": {
+    "1": 22109,
+    "2": 451,
+    "5": 500
+  },
+  "high_conflict_group_count": 0,
+  "input_record_count": 25511,
+  "master_instance_count": 23060,
+  "matching_index_statistics": {
+    "issue_url": {
+      "duplicate_keys": 0,
+      "records_with_key": 0,
+      "unique_keys": 0
+    },
+    "pr_url": {
+      "duplicate_keys": 0,
+      "records_with_key": 0,
+      "unique_keys": 0
+    },
+    "repo_base_commit": {
+      "duplicate_keys": 3034,
+      "records_with_key": 24163,
+      "unique_keys": 19468
+    },
+    "repo_patch_hash": {
+      "duplicate_keys": 1052,
+      "records_with_key": 23694,
+      "unique_keys": 21739
+    },
+    "repo_problem_hash": {
+      "duplicate_keys": 1401,
+      "records_with_key": 23679,
+      "unique_keys": 21277
+    },
+    "source_instance_id": {
+      "duplicate_keys": 951,
+      "records_with_key": 25511,
+      "unique_keys": 23060
+    }
+  },
+  "matching_policy": [
+    "issue_url 完全一致",
+    "pr_url 完全一致",
+    "可靠 source_instance_id 完全一致",
+    "repo + base_commit 完全一致",
+    "repo + patch 哈希完全一致",
+    "repo + 问题描述哈希一致且 base_commit 不冲突"
+  ],
+  "merged_group_count": 951,
+  "outputs": {
+    "instance_aliases": "data/registry/instance_aliases.jsonl",
+    "master_instances": "data/registry/master_instances.jsonl",
+    "registry_conflicts": "data/registry/registry_conflicts.jsonl",
+    "unmatched_records": "data/registry/unmatched_records.jsonl"
+  },
+  "schema_version": "1.0",
+  "script_version": "1.1.0",
+  "single_record_group_count": 22109,
+  "source_combination_counts": {
+    "contextbench": 1136,
+    "swe_explore": 397,
+    "swe_explore+swebench": 451,
+    "swebench": 21076
+  },
+  "source_pair_overlap": {
+    "swe_explore<->swebench": 451
+  },
+  "source_record_counts": {
+    "contextbench": 3136,
+    "swe_explore": 848,
+    "swebench": 21527
+  },
+  "status": "passed"
+}

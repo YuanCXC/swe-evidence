@@ -1,0 +1,22 @@
+{
+  "backup_failures": "data/registry/git_snapshot_failures.before_repo_repair.jsonl",
+  "backup_manifest": "data/registry/git_snapshots.before_repo_repair.jsonl",
+  "final_success_count": 19311,
+  "generated_at_utc": "2026-07-29T05:49:22.325053+00:00",
+  "git_version": "git version 2.52.0.windows.1",
+  "input_failure_count": 78,
+  "remaining_failure_count": 0,
+  "repaired_count": 78,
+  "repo_action_counts": {
+    "cloned_partial": 3,
+    "fetched_once": 2
+  },
+  "resolution_method_counts": {
+    "source_metadata": 78
+  },
+  "retryable_failure_count": 78,
+  "schema_version": "1.0",
+  "script_version": "1.0.0",
+  "status": "passed",
+  "unresolved_retry_count": 0
+}

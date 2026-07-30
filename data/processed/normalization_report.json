@@ -1,0 +1,51 @@
+{
+  "file_counts": {
+    "data/raw/contextbench/contextbench_verified.parquet": 500,
+    "data/raw/contextbench/contextbench_verified_test.parquet": 50,
+    "data/raw/contextbench/contextbench_verified_train.parquet": 450,
+    "data/raw/contextbench/full.parquet": 1136,
+    "data/raw/contextbench/selected_500_instances.csv": 500,
+    "data/raw/contextbench/test.parquet": 50,
+    "data/raw/contextbench/train.parquet": 450,
+    "data/raw/swe_explore/bench.final.public.jsonl": 848,
+    "data/raw/swebench/dev-00000-of-00001.parquet": 225,
+    "data/raw/swebench/test-00000-of-00001.parquet": 2294,
+    "data/raw/swebench/train-00000-of-00001.parquet": 19008
+  },
+  "generated_at_utc": "2026-07-29T02:34:34.641983+00:00",
+  "input_file_count": 11,
+  "missing_core_fields": {
+    "contextbench": {
+      "problem_statement": 501,
+      "repo": 500
+    },
+    "swe_explore": {
+      "base_commit": 848,
+      "problem_statement": 848,
+      "repo": 848
+    }
+  },
+  "notes": [
+    "该阶段只统一字段，不去重、不合并跨来源实例。",
+    "patch 和 test_patch 被保留为离线标签资产，后续不得进入在线证据获取模型输入。",
+    "repo、base_commit 或 problem_statement 缺失的记录不会在本阶段被删除。",
+    "external_context 和 trajectory 是基于字段名关键词自动收集的候选数据，后续仍需来源专用解析。"
+  ],
+  "outputs": {
+    "normalized_instances": "data/processed/normalized_instances.jsonl",
+    "observed_field_catalog": "data/processed/observed_field_catalog.json",
+    "rejected_records": "data/processed/rejected_records.jsonl"
+  },
+  "rejection_counts": {},
+  "schema_version": "1.0",
+  "script_version": "1.1.0",
+  "source_counts": {
+    "contextbench": 3136,
+    "swe_explore": 848,
+    "swebench": 21527
+  },
+  "status": "passed",
+  "total_records_normalized": 25511,
+  "total_records_read": 25511,
+  "total_records_rejected": 0
+}

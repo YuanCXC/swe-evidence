@@ -1,0 +1,36 @@
+{
+  "candidate_file_count": 100,
+  "evidence_unit_count": 287,
+  "extraction_method_counts": {
+    "anchored_line_window": 132,
+    "python_ast": 155
+  },
+  "failure_count": 1,
+  "generated_at_utc": "2026-07-29T06:51:26.293338+00:00",
+  "language_counts": {
+    "python": 99,
+    "text": 1
+  },
+  "limits": {
+    "max_file_bytes": 2097152,
+    "max_file_lines": 50000,
+    "max_unit_lines": 400,
+    "window_radius": 20
+  },
+  "network_behavior": "仅对候选文件执行 git show；partial clone 可能按需获取这些文件 blob，不读取无关文件。",
+  "outputs": {
+    "evidence_units": "data/processed/evidence_units/evidence_units.jsonl",
+    "extraction_failures": "data/processed/evidence_units/extraction_failures.jsonl",
+    "file_records": "data/processed/evidence_units/file_records.jsonl"
+  },
+  "processed_file_count": 100,
+  "processed_instance_count": 5,
+  "schema_version": "1.0",
+  "script_version": "1.0.0",
+  "status": "passed",
+  "unit_type_counts": {
+    "class": 56,
+    "function": 99,
+    "line_window": 132
+  }
+}
