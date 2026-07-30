@@ -22,7 +22,8 @@ unified_swe_dataset_v1/
 - 模型输入与离线监督严格分区。
 - train、validation、benchmark 使用完全相同的物理 Schema。
 - 三个任务文件在发布前完成物理切分，不依赖运行时随机划分。
-- 完整代码只保存在 `repository_corpus.parquet`，任务文件通过稳定 ID 引用。
+- 完整代码只保存在 `repository_corpus.parquet`，每个文件的正文只保存一次。
+- 任务文件通过稳定的 `evidence_id` 引用代码。
 
 ## 2. 文件职责
 
@@ -31,7 +32,7 @@ unified_swe_dataset_v1/
 | `train.parquet` | 一个可训练的统一任务 | 参数训练、行为模仿、弱监督预训练 |
 | `validation.parquet` | 一个冻结的验证任务 | 调参、早停、阈值选择、回归验证 |
 | `benchmark.parquet` | 一个正式评测任务 | 证据检索、充分性判断、代码修复评测 |
-| `repository_corpus.parquet` | 一个 Evidence Unit | 为三个任务 split 提供共享代码语料 |
+| `repository_corpus.parquet` | 一个仓库文件 | 保存完整文件正文及嵌套的 Evidence Unit |
 | `manifest.json` | 整个发布版本的元数据 | Schema、来源、哈希、统计和审计 |
 
 ## 3. 公共任务 Schema
@@ -374,24 +375,133 @@ unified_swe_dataset_v1/
 
 ## 8. `repository_corpus.parquet`
 
-每行表示一个 Evidence Unit：
+### 8.1 行粒度
 
-| 字段 | 类型 | 含义 |
-|------|------|------|
-| `evidence_id` | string | 全局唯一证据 ID |
-| `snapshot_id` | string | 所属修复前快照 |
-| `repo` | string | 规范化仓库名 |
-| `commit` | string | 已解析 commit |
-| `path` | string | 仓库内相对路径 |
-| `language` | string | 内容语言 |
-| `unit_type` | string | file、class、function、span 或 code_block |
-| `symbol` | string | 符号名；不适用时为 null |
-| `start_line` | int32 | 起始行 |
-| `end_line` | int32 | 结束行 |
-| `content` | string | 完整文本 |
-| `content_sha256` | string | 内容哈希 |
+每行表示一个修复前仓库快照中的文件。文件正文只保存一次，类、函数、方法和代码块以嵌套的行号范围表示。
 
-任何任务只能检索自身 `snapshot_id` 对应的 Evidence Unit。
+```json
+{
+  "file_id": "file_django_abc123_query_py",
+  "snapshot_id": "snapshot_django_abc123",
+  "repo": "django/django",
+  "commit": "abc123",
+  "path": "django/db/models/query.py",
+  "language": "python",
+  "content": "class QuerySet:",
+  "content_sha256": "7a80d963",
+  "line_count": 850,
+  "attributes": {
+    "is_test": false,
+    "is_generated": false,
+    "is_vendor": false,
+    "is_binary": false,
+    "searchable": true
+  },
+  "evidence_units": [
+    {
+      "evidence_id": "ev_django_abc123_query_file",
+      "unit_type": "file",
+      "symbol": null,
+      "qualified_name": null,
+      "start_line": 1,
+      "end_line": 850,
+      "parent_evidence_id": null,
+      "content_sha256": "7a80d963"
+    }
+  ],
+  "imports": [],
+  "extraction": {
+    "parser": "tree-sitter-python",
+    "parser_version": "0.23.0",
+    "status": "success"
+  }
+}
+```
+
+### 8.2 文件字段
+
+| 字段 | 类型 | 必填 | 含义 |
+|------|------|------|------|
+| `file_id` | string | 是 | 当前快照下的唯一文件 ID |
+| `snapshot_id` | string | 是 | 所属修复前仓库快照 |
+| `repo` | string | 是 | 规范化仓库名 |
+| `commit` | string | 是 | 已解析 commit |
+| `path` | string | 是 | 仓库内相对路径 |
+| `language` | string | 是 | 编程语言或文档类型 |
+| `content` | string | 否 | 完整文件正文 |
+| `content_sha256` | string | 是 | 文件内容哈希 |
+| `line_count` | int32 | 是 | 文件总行数 |
+| `attributes` | struct | 是 | 文件分类和检索控制 |
+| `evidence_units` | list\<struct> | 是 | 文件内的证据单元 |
+| `imports` | list\<struct> | 是 | 文件的静态依赖 |
+| `extraction` | struct | 是 | 结构提取过程和状态 |
+
+唯一性：
+
+- `file_id` 在整个 corpus 中唯一。
+- `snapshot_id + path` 在整个 corpus 中唯一。
+- 同一路径在不同 commit 下对应不同的 `file_id`。
+- `content_sha256` 只描述正文，不承担文件身份。
+
+二进制文件可以保留路径和哈希，但 `content=null`、`attributes.searchable=false` 且 `evidence_units=[]`。
+
+### 8.3 `attributes`
+
+| 子字段 | 类型 | 含义 |
+|--------|------|------|
+| `is_test` | bool | 是否为测试文件 |
+| `is_generated` | bool | 是否为自动生成文件 |
+| `is_vendor` | bool | 是否为第三方依赖 |
+| `is_binary` | bool | 是否为二进制文件 |
+| `searchable` | bool | 是否允许 Retriever 检索 |
+
+默认情况下，二进制、vendor 和 generated 文件不可检索。测试文件是否可检索由任务的 `input.retrieval_scope` 决定。
+
+### 8.4 `evidence_units`
+
+`evidence_units` 保存文件内的可检索结构，不重复保存正文：
+
+| 子字段 | 类型 | 含义 |
+|--------|------|------|
+| `evidence_id` | string | 全局唯一 Evidence Unit ID |
+| `unit_type` | string | file、class、function、method、code_block 或 doc_section |
+| `symbol` | string | 简短符号名；不适用时为 null |
+| `qualified_name` | string | 完整限定名；不适用时为 null |
+| `start_line` | int32 | 起始行，包含该行 |
+| `end_line` | int32 | 结束行，包含该行 |
+| `parent_evidence_id` | string | 父级 Evidence Unit；没有时为 null |
+| `content_sha256` | string | 对行号范围对应正文切片计算的哈希 |
+
+行号采用 1-based、闭区间语义。Evidence Unit 的正文通过以下规则恢复：
+
+```python
+unit_content = file_content_lines[start_line - 1:end_line]
+```
+
+每个可搜索文本文件必须生成且只生成一个 `unit_type=file` 的 Evidence Unit，范围为 `1..line_count`。解析成功时继续生成 class、function、method 和 doc_section。无法解析的可搜索文本文件按固定窗口降级生成 `code_block`，不得因为解析失败丢弃完整文件。
+
+所有监督标签统一引用 `evidence_id`：文件级标签指向 `unit_type=file`，细粒度标签指向对应的类、函数、方法、代码块或文档章节。`file_id` 只用于标识 corpus 的物理文件行，不作为监督标签 ID。
+
+### 8.5 `imports`
+
+`imports` 保存第一版检索扩展所需的静态依赖：
+
+| 子字段 | 类型 | 含义 |
+|--------|------|------|
+| `module` | string | 源文件声明的模块或包 |
+| `resolved_path` | string | 当前 snapshot 中解析出的目标路径；未解析时为 null |
+
+第一版不发布完整调用图、继承图或模型生成的关系边。
+
+### 8.6 `extraction`
+
+| 子字段 | 类型 | 含义 |
+|--------|------|------|
+| `parser` | string | 解析器名称；未使用解析器时为 `line-window` |
+| `parser_version` | string | 解析器版本 |
+| `status` | string | `success`、`fallback` 或 `unsupported` |
+
+任何任务只能访问自身 `snapshot_id` 对应、且 `attributes.searchable=true` 的文件和 Evidence Unit。训练加载器可以展开 `evidence_units` 形成函数级候选，但展开结果不是新的发布文件。
 
 ## 9. `manifest.json`
 
@@ -406,7 +516,7 @@ unified_swe_dataset_v1/
 - strong、support、weak 的数量；
 - 去重和身份冲突统计；
 - split 防泄漏审计；
-- Evidence Unit 引用完整率；
+- 文件和 Evidence Unit 引用完整率；
 - 构建命令、随机种子和工具版本。
 
 ## 10. 发布硬门槛
@@ -418,7 +528,8 @@ unified_swe_dataset_v1/
 - 模型可见输入中包含 Gold；
 - validation 或 benchmark 存在轨迹；
 - benchmark 任务或派生任务进入 train；
-- Evidence Unit 引用完整率低于 100%；
+- corpus 中存在重复 `file_id` 或重复 `snapshot_id + path`；
+- `evidence_id` 引用完整率低于 100%；
 - manifest 文件哈希与实际文件不一致；
 - 高严重度身份冲突进入任一任务文件；
 - benchmark 的 split 或 membership 未冻结。
@@ -434,3 +545,5 @@ unified_swe_dataset_v1/
 - 多来源通过 provenance、监督和轨迹合并到任务。
 - validation 和 benchmark 不包含轨迹。
 - benchmark 支持内部完整版和对外脱敏版。
+- `repository_corpus.parquet` 每行代表一个文件，Evidence Unit 作为嵌套行号范围保存。
+- 文件正文只保存一次，训练时按行号展开 Evidence Unit。
