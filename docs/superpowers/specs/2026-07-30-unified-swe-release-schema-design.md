@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-本设计定义 Unified SWE Dataset 的最终发布产物，以及训练、验证、评测三个任务文件的统一字段结构。
+本设计定义 Unified SWE Dataset 的最终发布产物，以及训练、验证、评测三个任务文件的统一字段结构。数据集服务于预算约束下的仓库证据获取：模型根据问题、当前证据状态和候选动作，判断下一步应获取单个证据、证据组合，还是停止检索。
 
 数据处理阶段使用 JSONL 作为可审计真值；正式发布阶段转换为 Parquet。最终发布只保留 5 个文件：
 
@@ -24,6 +24,33 @@ unified_swe_dataset_v1/
 - 三个任务文件在发布前完成物理切分，不依赖运行时随机划分。
 - 完整代码只保存在 `repository_corpus.parquet`，每个唯一文件版本的正文只保存一次。
 - 任务文件通过稳定的 `evidence_id` 引用代码。
+- SWE-bench 是唯一任务基准；外部来源必须可靠对齐到 SWE-bench，否则不下载、不合并、不发布。
+- 监督区分确定性标签、跨来源标签和教师伪标签，不把三者混成同等可信的 Gold。
+- Cross-Encoder 只读取有界 Evidence Unit，不读取整个仓库或不受控的完整文件正文。
+
+### 1.1 研究目标
+
+模型学习的不是补丁生成，而是状态相关的证据动作价值：
+
+```text
+(q, K, A) -> utility(A | q, K)
+```
+
+- `q`：SWE-bench 问题描述。
+- `K`：当前已获取的证据集合。
+- `A`：单证据动作 `[u]`、双证据动作 `[u, v]` 或 `STOP`。
+- `utility`：动作对证据义务完成度和进度的增益，训练时可扣除正文 Token 成本。
+
+研究重点是证据之间的互补、替代、冗余、独立和冲突关系，以及严格的停止条件。补丁和测试只用于离线监督与最终系统评测，不进入 Cross-Encoder 在线输入。
+
+### 1.2 非目标
+
+- 不从零训练大语言模型，只微调预训练 Cross-Encoder Ranker。
+- 不把百万级样本数作为目标；必须同时报告独立任务数、状态数、动作数和候选数。
+- 不把完整仓库拼接到模型输入。
+- 不把成功轨迹中的所有读取自动视为必要证据。
+- 不把教师模型输出直接当作 benchmark 真值。
+- 不引入无法与 SWE-bench 可靠对齐的新任务数据集。
 
 ## 2. 文件职责
 
@@ -144,35 +171,104 @@ unified_swe_dataset_v1/
 | `test_patch` | string | 否 | 复现或验证问题的测试补丁 |
 | `hard_negative_evidence_ids` | list\<string> | 是 | 高相关但不支持结论的证据 |
 | `obligations` | list\<struct> | 是 | 证据义务及 witness |
+| `policy_states` | list\<struct> | 是 | 状态、候选动作、动作增益和 STOP 标签 |
+| `label_provenance` | list\<struct> | 是 | 确定性、跨来源、教师和人工标签的逐项来源记录 |
+
+`label_provenance` 中每项包含：
+
+| 子字段 | 类型 | 含义 |
+|--------|------|------|
+| `annotation_id` | string | 任务内唯一标注 ID |
+| `source` | string | `deterministic`、`cross_source`、`teacher_consensus` 或 `human` |
+| `source_record_ids` | list\<string> | 参与该判断的原始记录 ID |
+| `teacher_model` | string | 教师模型及 revision；非教师标签为 null |
+| `prompt_version` | string | Prompt 版本；非教师标签为 null |
+| `vote_count` | int32 | 一致票数；非投票标签为 null |
+| `agreement` | float32 | 一致率；非投票标签为 null |
+| `rule_verified` | bool | 是否通过确定性约束校验 |
+| `input_sha256` | string | 标注输入包的稳定哈希 |
 
 `evidence_labels` 中每项包含：
 
 | 子字段 | 类型 | 含义 |
 |--------|------|------|
 | `evidence_id` | string | `repository_corpus.parquet` 中的证据 ID |
-| `relevance` | string | `positive`、`negative`、`unknown` |
+| `relevance` | string | `positive`、`hard_negative`、`unknown`；未被 Gold 选中不能直接标为负例 |
 | `granularity` | string | file、class、function、span 或 code_block |
 | `source` | string | 标签来源 |
 | `confidence` | float32 | 映射或人工标注置信度，范围为 `[0, 1]` |
+| `annotation_ids` | list\<string> | 对应的 `label_provenance.annotation_id` |
 
 `obligations` 中每项包含：
 
 | 子字段 | 类型 | 含义 |
 |--------|------|------|
 | `obligation_id` | string | 任务内唯一义务 ID |
+| `type` | string | 固定的义务类型 |
 | `description` | string | 必须得到证据支持的判断 |
-| `witness_evidence_ids` | list\<string> | 支持该义务的 Evidence Unit |
+| `applicable` | bool | 该义务是否适用于当前任务 |
+| `mandatory` | bool | 是否为严格 STOP 的必要条件 |
+| `confidence` | float32 | 义务定义置信度 |
+| `construction_method` | string | 规则、跨来源一致、教师共识或人工审核 |
+| `witness_groups` | list\<struct> | 可以满足该义务的一个或多个证据组 |
+| `annotation_ids` | list\<string> | 对应的标注来源 ID |
+
+`witness_groups` 中每项包含：
+
+| 子字段 | 类型 | 含义 |
+|--------|------|------|
+| `group_id` | string | 任务内唯一 witness group ID |
+| `evidence_ids` | list\<string> | 该组引用的 Evidence Unit |
+| `logic` | string | 固定为 `AND`；同一义务下不同 group 之间按 `OR` 解释 |
+| `source` | string | ContextBench、SWE-Explore、patch、结构规则、教师或人工 |
+| `confidence` | float32 | 证据组置信度 |
+| `annotation_ids` | list\<string> | 对应的标注来源 ID |
+
+同一 group 内的证据必须共同获得；不同 group 是可替代路径。例如，`caller + callee` 可以组成一个 AND group，而集成测试可以组成另一个单证据 group。前者内部是互补关系，两个 group 之间是替代关系。
+
+`policy_states` 中每项包含：
+
+| 子字段 | 类型 | 含义 |
+|--------|------|------|
+| `state_id` | string | 任务内唯一状态 ID |
+| `step` | int32 | 状态序号；初始状态为 0 |
+| `evidence_ids` | list\<string> | 当前状态 `K` 已获得的 Evidence Unit |
+| `completed_obligation_ids` | list\<string> | 已完整满足的义务 |
+| `completion_score` | float32 | 当前强制义务完成度 `C(K)` |
+| `progress_score` | float32 | 当前 witness 进度 `P(K)` |
+| `candidate_actions` | list\<struct> | 单证据、双证据和 STOP 动作 |
+| `label_source` | string | 状态及动作标签的构造来源 |
+| `confidence` | float32 | 状态级标签置信度 |
+
+`candidate_actions` 中每项包含：
+
+| 子字段 | 类型 | 含义 |
+|--------|------|------|
+| `action_id` | string | 规范化动作 ID |
+| `action_type` | string | `single`、`pair` 或 `stop` |
+| `evidence_ids` | list\<string> | 单证据长度为 1，双证据长度为 2，STOP 为空 |
+| `completion_gain` | float32 | 动作带来的 `C` 增量 |
+| `progress_gain` | float32 | 动作带来的 `P` 增量 |
+| `token_cost` | int32 | 加入状态的正文 Token 数 |
+| `relation` | string | `complement`、`substitute`、`redundant`、`independent`、`conflict` 或 `unknown` |
+| `covered_obligation_ids` | list\<string> | 动作完成或推进的义务 |
+| `acceptable` | bool | 是否属于当前状态的可接受动作集合 |
+| `label_source` | string | 规则、跨来源、轨迹、教师共识或人工 |
+| `confidence` | float32 | 动作标签置信度 |
+| `relation_loss_mask` | bool | 是否参与关系分类损失 |
+| `annotation_ids` | list\<string> | 对应的标注来源 ID |
+
+单证据和 STOP 动作的 `relation` 为 null，且 `relation_loss_mask=false`。双证据动作的 `evidence_ids` 必须排序，保证 `[u, v]` 与 `[v, u]` 只有一个物理动作。训练时可以随机交换两段正文的输入顺序，避免模型学习位置偏差。
 
 允许的 `training_targets`：
 
 - `retrieval`
 - `reranking`
 - `evidence_policy`
-- `repair`
-- `trajectory_imitation`
-- `failure_modeling`
-- `test_generation`
-- `pretraining`
+- `interaction_classification`
+- `stop_prediction`
+
+补丁生成、测试生成和失败轨迹建模不属于本数据集第一版的训练目标。
 
 ### 3.5 `trajectories`
 
@@ -257,7 +353,7 @@ unified_swe_dataset_v1/
 
 ### 4.1 用途
 
-`train.parquet` 用于模型参数训练。任务可以同时服务多个训练目标，无需为 Retriever、Reranker、Evidence Policy 和 Repair 分别复制行。
+`train.parquet` 用于模型参数训练。任务可以同时服务 Retriever、Reranker、Evidence Policy、关系分类和 STOP 预测，无需为不同训练目标复制任务行。
 
 ### 4.2 字段约束
 
@@ -274,22 +370,20 @@ unified_swe_dataset_v1/
 
 | 等级 | 典型来源 | 建议权重 |
 |------|----------|---------:|
-| `strong` | ContextBench、人工确认 Gold | 1.0 |
-| `support` | SWE-bench patch、Oracle、真实可执行任务 | 0.7 |
-| `weak` 且真实 | 自动映射、模型轨迹 | 0.4 |
-| `weak` 且合成 | SWE-smith | 0.2 |
+| `strong` | ContextBench、跨来源一致、人工确认 | 1.0 |
+| `support` | SWE-bench patch、SWE-Explore core、规则验证教师标签 | 0.7 |
+| `weak` | SWE-Explore optional、单教师或行为轨迹 | 0.4 |
 
 实际采样策略由训练配置控制，数据集只记录建议值。
 
 ### 4.3 来源合并
 
 - SWE-bench 提供任务、仓库、commit 和 patch。
-- ContextBench 为已有任务补充 Gold evidence，不新增任务。
-- Oracle 提供离线文件级监督。
-- BM25 提供 hard negatives 和 baseline，不写入 `input`。
-- SWE-Explore 与 SWE-agent trajectories 挂到已有任务。
-- SWE-rebench 和 SWE-Gym 在无对应任务时创建新任务。
-- SWE-smith 创建 `weak` 合成任务，只能进入 train。
+- ContextBench 仅为能够严格对齐的 SWE-bench 任务补充 Gold evidence，不新增任务。
+- SWE-Explore 仅为能够严格对齐的 SWE-bench 任务补充共识区域、可选区域和读取顺序，不新增任务。
+- 无法与 SWE-bench 对齐的 ContextBench、SWE-Explore 或其他来源记录不下载、不合并、不发布。
+- 第一版不接入 SWE-rebench、SWE-Gym、SWE-smith、Nebius 或其他扩展任务集。
+- SWE-bench train 中缺少强语义标签的任务，可以通过受约束教师标注补足训练监督。
 
 ## 5. `validation.parquet`
 
@@ -312,12 +406,15 @@ unified_swe_dataset_v1/
 
 ### 5.3 切分要求
 
-- validation 占可训练真实任务的 5%～10%。
-- 优先使用时间切分和仓库隔离。
-- 至少覆盖 20 个仓库。
-- 不包含 SWE-smith。
-- 不包含正式 benchmark 任务或其变体。
-- 不包含与 benchmark 共享 `task_group_id` 的任务。
+- `train.parquet` 继承 SWE-bench train，共 19,008 个任务。
+- `validation.parquet` 继承 SWE-bench dev，共 225 个任务。
+- `benchmark.parquet` 继承 SWE-bench test，共 2,294 个任务。
+- ContextBench、SWE-Explore 和教师派生标签必须继承对应 SWE-bench 任务的 split，不得重新随机切分。
+- 同一 `task_group_id`、Issue、PR 或派生变体不得跨 split。
+- train、validation 和 benchmark 在任何标签生成、教师调用和候选挖掘之前冻结。
+- benchmark 任务及其标签不得参与模型参数更新、阈值拟合或困难负例挖掘。
+
+当前冻结来源的强监督分布为：train 中 38 个 ContextBench Poly 对齐任务；benchmark 中 313 个 ContextBench Verified 对齐任务和 451 个 SWE-Explore Verified 对齐任务。由于大部分跨来源强标签位于 benchmark，教师标注的主要用途是补足 train 和 validation，而不是把 benchmark 数据迁移到 train。
 
 ## 6. `benchmark.parquet`
 
@@ -340,9 +437,10 @@ unified_swe_dataset_v1/
 
 | 轨道 | 主要来源 | 主要指标 |
 |------|----------|----------|
-| 代码修复 | SWE-bench Verified、Lite、冻结 holdout | `patch_resolved`、测试通过率 |
-| 证据定位 | ContextBench、Oracle、MULocBench | Recall@K、MRR、nDCG |
-| 证据充分性 | ContextBench、人工审核样本 | obligation coverage、STOP accuracy |
+| 代码修复 | SWE-bench test | `patch_resolved`、测试通过率 |
+| 证据定位 | ContextBench、SWE-Explore、patch 派生位置 | Recall@K、MRR、nDCG |
+| 证据充分性 | ContextBench、SWE-Explore、人工审核样本 | obligation coverage、STOP accuracy |
+| 证据交互 | witness group 与人工审核样本 | pair relation F1、pair utility ranking |
 
 ### 6.3 Gold 发布策略
 
@@ -478,6 +576,8 @@ unified_swe_dataset_v1/
 | `end_line` | int32 | 结束行，包含该行 |
 | `parent_evidence_id` | string | 父级 Evidence Unit；没有时为 null |
 | `content_sha256` | string | 对行号范围对应正文切片计算的哈希 |
+| `token_count` | int32 | 使用冻结 Tokenizer 计算的正文 Token 数 |
+| `scoreable` | bool | 是否允许作为 Cross-Encoder 候选动作 |
 
 行号采用 1-based、闭区间语义。Evidence Unit 的正文通过以下规则恢复：
 
@@ -487,7 +587,11 @@ unit_content = file_content_lines[start_line - 1:end_line]
 
 每个可搜索文本文件必须生成且只生成一个 `unit_type=file` 的 Evidence Unit，范围为 `1..line_count`。解析成功时继续生成 class、function、method 和 doc_section。无法解析的可搜索文本文件按固定窗口降级生成 `code_block`，不得因为解析失败丢弃完整文件。
 
+文件级 Evidence Unit 用于成员关系、文件级召回和审计。如果正文超过 Cross-Encoder 上限，则必须设置 `scoreable=false`，不能直接成为动作。过大的类、函数或 ContextBench/SWE-Explore 区域继续按语法边界或固定窗口切分，直到形成有界单元。双证据动作的两段正文加上问题和状态摘要后仍必须满足模型最大长度；无法满足时拆分动作或放弃该 pair，不允许静默截断关键证据。
+
 所有监督标签统一引用 `evidence_id`：文件级标签指向 `unit_type=file`，细粒度标签指向对应的类、函数、方法、代码块或文档章节。`file_version_id` 只用于标识 corpus 的物理文件版本行，不作为监督标签 ID。
+
+训练加载器根据 `file_version_id + start_line + end_line` 恢复 Evidence Unit 正文。任务文件不重复保存代码正文，只保存 `evidence_id`、状态和标签。
 
 ### 8.5 `imports`
 
@@ -517,8 +621,7 @@ unit_content = file_content_lines[start_line - 1:end_line]
 完整数据集通过一条命令生成：
 
 ```powershell
-python scripts/build_unified_dataset.py `
-  --config configs/unified_swe_v1.json
+python scripts/build_unified_dataset.py --format jsonl
 ```
 
 用户可见输入：
@@ -526,8 +629,11 @@ python scripts/build_unified_dataset.py `
 ```text
 data/raw/
 data/cache/repos/
-configs/unified_swe_v1.json
 ```
+
+第一版只允许在 `scripts/` 下新增或保留一个最终构建入口 `build_unified_dataset.py`。不得为 adapter、标签阶段或发布阶段新增其他 Python 文件，也不使用外部配置文件。来源 revision、字段映射、质量门槛和 Prompt 版本全部作为版本化常量集中在该脚本内。教师 API 地址、密钥和模型名通过环境变量传入，密钥不得写入脚本、SQLite、manifest 或发布文件。
+
+缺少已启用的 SWE-bench、ContextBench 或 SWE-Explore 原始文件时，脚本从固定官方地址下载并校验 revision 与哈希。无法与 SWE-bench 对齐的来源记录不进入后续下载和仓库快照准备。
 
 唯一构建状态文件：
 
@@ -539,12 +645,20 @@ data/.build/unified_swe_v1.sqlite3
 
 ```text
 data/unified_swe_dataset_v1/
-├── train.parquet
-├── validation.parquet
-├── benchmark.parquet
-├── repository_corpus.parquet
+├── train.jsonl
+├── validation.jsonl
+├── benchmark.jsonl
+├── repository_corpus.jsonl
 └── manifest.json
 ```
+
+数据处理和实验阶段默认使用 JSONL，方便逐行检查。正式发布时运行：
+
+```powershell
+python scripts/build_unified_dataset.py --format parquet --release
+```
+
+正式发布保持第 1 节定义的 4 个 Parquet 文件和 1 个 `manifest.json`。JSONL 与 Parquet 共用同一逻辑 Schema 和稳定 ID，格式转换不得重新生成标签或改变 split。
 
 构建过程不得再生成 `normalized_instances.jsonl`、`master_instances.jsonl`、`split_assignments.jsonl`、`candidate_files.jsonl`、`evidence_units.jsonl` 或 `certification_labels.jsonl` 等独立中间产物。
 
@@ -563,6 +677,11 @@ snapshots
 file_versions
 snapshot_file_memberships
 evidence_units
+obligations
+witness_groups
+policy_states
+candidate_actions
+teacher_cache
 conflicts
 build_phases
 ```
@@ -582,7 +701,10 @@ SQLite 只承担规范化、关联、断点和审计状态，不属于最终发�
 → 唯一文件版本和成员关系枚举
 → Evidence Unit 提取
 → 监督与轨迹映射
-→ 流式写入临时 Parquet
+→ 义务与 witness group 构建
+→ 必要时执行受约束教师标注
+→ 状态与单/双证据动作标签构建
+→ 流式写入临时 JSONL 或 Parquet
 → 完整性审计
 → 原子发布
 ```
@@ -601,7 +723,7 @@ SQLite 只承担规范化、关联、断点和审计状态，不属于最终发�
 
 ### 9.4 临时文件和原子发布
 
-Parquet 使用分批 row group 流式写入，不要求将完整数据载入内存。构建器先写入：
+JSONL 逐行写入；Parquet 使用分批 row group 流式写入，不要求将完整数据载入内存。构建器先写入与目标格式一致的临时目录。正式 Parquet 发布示例如下：
 
 ```text
 data/unified_swe_dataset_v1.tmp/
@@ -625,7 +747,6 @@ data/unified_swe_dataset_v1.tmp/
 
 ```powershell
 python scripts/build_unified_dataset.py `
-  --config configs/unified_swe_v1.json `
   --clean-state
 ```
 
@@ -639,9 +760,12 @@ python scripts/build_unified_dataset.py `
 - `schema_version`；
 - `release_flavor`；
 - 每个来源的版本、revision、许可证和用途；
-- 5 个发布文件的行数、大小和 SHA-256；
+- 4 个数据文件的行数、大小和 SHA-256；`manifest.json` 不记录自身哈希；
 - train、validation、benchmark 的任务数量；
 - strong、support、weak 的数量；
+- 独立任务数、状态数、单证据动作数、双证据动作数和候选数；
+- 义务类型、witness group 大小、关系类别和 STOP 标签分布；
+- 教师模型、Prompt 版本、调用数量、一致率、规则拒绝率和人工抽检结果；
 - 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
 - 去重和身份冲突统计；
 - split 防泄漏审计；
@@ -657,14 +781,23 @@ python scripts/build_unified_dataset.py `
 - 模型可见输入中包含 Gold；
 - validation 或 benchmark 存在轨迹；
 - benchmark 任务或派生任务进入 train；
+- 任一 mandatory obligation 没有可解析的 witness group；
+- 任一正 STOP 状态仍存在未完成的 mandatory obligation；
+- 任一负 STOP 状态已经完成全部 mandatory obligations；
+- 重复、包含或相同内容证据被标成强 `complement`；
+- 教师输出引用不存在、跨 snapshot 或未提供给教师的 `evidence_id`；
+- teacher-only 标签进入 benchmark 主要指标；
+- ContextBench overlay 被重复计为新任务；
+- SWE-Explore 的 `meta.num_read_core` 被用作真实列表长度；
+- SWE-Explore 的整文件读取被无界展开成 Cross-Encoder 正文；
 - corpus 中存在重复 `file_version_id` 或重复 `repo + path + blob_oid`；
 - 展开成员关系后，同一 `snapshot_id + path` 命中多个文件版本；
 - Git tree 中的 `path + blob_oid` 与 corpus 成员关系不一致；
 - `blob_oid`、文件正文和 `content_sha256` 校验不一致；
 - `evidence_id` 引用完整率低于 100%；
-- manifest 文件哈希与实际文件不一致；
+- manifest 记录的任一数据文件哈希与实际文件不一致；
 - 高严重度身份冲突进入任一任务文件；
-- benchmark 的 split 或 membership 未冻结。
+- benchmark 的 split 或 membership 未冻结；
 - 任何临时文件或未完成阶段被标记为正式 release。
 
 ## 12. 已确认决策
@@ -672,6 +805,8 @@ python scripts/build_unified_dataset.py `
 - 原始来源保留自身格式；内部派生状态统一存入单个 SQLite，正式发布使用 Parquet。
 - 最终发布包含 5 个文件。
 - 完整数据集由一条命令生成。
+- 最终构建只使用 `scripts/build_unified_dataset.py`，不新增配置文件或分阶段脚本。
+- 数据处理和实验阶段使用 JSONL，正式发布转换为 Parquet。
 - 构建过程只保留一个可断点续跑的 SQLite 状态库，不发布独立中间 JSONL。
 - 5 个最终文件通过临时目录流式生成，并在完整性审计后原子发布。
 - train、validation、benchmark 提前物理分开。
@@ -685,3 +820,562 @@ python scripts/build_unified_dataset.py `
 - 多个代码快照通过 `snapshot_ids` 共享相同文件版本，文件正文只保存一次。
 - Evidence Unit 作为嵌套行号范围保存，训练时按行号展开。
 - import 声明随文件版本保存，snapshot 相关的目标路径在加载时解析。
+- SWE-bench 是唯一任务基准，ContextBench 和 SWE-Explore 只补充能够严格对齐的监督。
+- 采用语义义务、AND witness group 和 group 间 OR 的方案 C。
+- 评分采用完成度 `C(K)` 和进度 `P(K)` 两个原始分量，STOP 使用严格 mandatory 覆盖规则。
+- 动作空间包含单证据、双证据和 STOP；双证据关系支持互补、替代、冗余、独立、冲突和未知。
+- 标签不足时使用受约束教师模型，但完成度、进度、动作增益和 STOP 始终由程序计算。
+
+## 13. 冻结数据源与实测规模
+
+### 13.1 数据源范围
+
+第一版只使用以下来源：
+
+| 来源 | 角色 | 是否创建新任务 | 对齐要求 |
+|------|------|----------------|----------|
+| SWE-bench | 唯一任务基准、问题、commit、patch 和测试 | 是 | 不适用 |
+| ContextBench | Gold context 和细粒度强证据 | 否 | 必须可靠映射到 SWE-bench `instance_id` |
+| SWE-Explore | 多成功轨迹共识区域、可选区域和读取顺序 | 否 | 必须精确命中 SWE-bench `instance_id` |
+| repository snapshot | 修复前完整仓库语料 | 否 | 必须匹配 SWE-bench `repo + base_commit` |
+
+来源缺失时，单脚本从官方固定 revision 下载。下载顺序先取任务元数据和 ID，完成对齐后才准备仓库快照，避免下载最终会被拒绝的非对齐任务。
+
+### 13.2 当前冻结数据的实测规模
+
+| 项目 | 数量 |
+|------|-----:|
+| SWE-bench train | 19,008 |
+| SWE-bench dev | 225 |
+| SWE-bench test | 2,294 |
+| SWE-bench 总任务 | 21,527 |
+| ContextBench 原始主任务 | 1,136 |
+| ContextBench 严格对齐任务 | 351 |
+| SWE-Explore 原始任务 | 848 |
+| SWE-Explore 严格对齐任务 | 451 |
+| ContextBench 与 SWE-Explore 交集 | 283 |
+| 两类强来源并集 | 519 |
+
+519 个强来源任务中，38 个属于 SWE-bench train，481 个属于 SWE-bench test。不得为了增加训练标签而把 481 个 test 任务迁移到 train。训练标签不足时使用受约束教师标注 SWE-bench train，而不是破坏 benchmark 隔离。
+
+### 13.3 ContextBench 文件角色
+
+`data/raw/contextbench/full.parquet` 是唯一主任务表。其他 Parquet 和 CSV 只承担成员关系、选择状态、split 或 Gold context variant，不新增任务：
+
+| 文件 | 角色 |
+|------|------|
+| `full.parquet` | 唯一主任务表 |
+| `contextbench_verified.parquet` | 精选成员关系和监督 variant |
+| `contextbench_verified_train.parquet` | 精选训练 overlay |
+| `contextbench_verified_test.parquet` | 精选评测 overlay |
+| `train.parquet` | 普通训练 overlay |
+| `test.parquet` | 普通评测 overlay |
+| `selected_500_instances.csv` | 选择状态和统计元数据 |
+
+overlay 找不到 `full.parquet` 主记录时进入 SQLite 冲突表，不创建残缺任务。相同 variant 通过稳定 JSON 哈希去重；同键不同内容必须记录冲突。
+
+## 14. 义务、Witness Group 与评分
+
+### 14.1 固定义务类型
+
+每个任务只生成确实适用且能够获得证据支持的义务。允许类型如下：
+
+| 类型 | 含义 |
+|------|------|
+| `fault_location` | 故障发生的位置 |
+| `fault_logic` | 错误机制或错误逻辑 |
+| `dependency_context` | 调用、继承、导入等依赖约束 |
+| `state_flow` | 状态、参数或数据如何流动 |
+| `behavior_constraint` | 问题要求的正确行为 |
+| `repair_scope` | 修复可能影响的范围 |
+| `validation_constraint` | 测试、边界条件和回归约束 |
+
+不是每个任务都必须拥有全部 7 类义务。无法可靠定义的义务不创建；不能为了让模板完整而补造义务。
+
+### 14.2 方案 C 的逻辑语义
+
+义务是“必须弄清楚的问题”，不是某个固定文件或 span。一个义务可以有多个 witness group：
+
+```text
+obligation
+├── witness group 1: evidence A AND evidence B
+└── witness group 2: evidence C
+```
+
+- 同一 group 内按 AND 解释。
+- 同一义务下不同 group 按 OR 解释。
+- `A + B` 形成互补关系。
+- `[A, B]` 与 `C` 形成可替代路径。
+- 重叠窗口、包含窗口或相同内容不能组成互补 group。
+
+只有同时满足以下条件的义务才能设为 `mandatory=true`：
+
+1. 义务适用于当前问题。
+2. 至少存在一个能够解析到 repository corpus 的 witness group。
+3. 定义来自确定性规则、跨来源一致、教师共识且通过规则验证，或人工审核。
+4. 义务对理解故障或验证预期行为不可省略。
+
+### 14.3 完成度
+
+对义务 `r` 和当前状态 `K`：
+
+```text
+covered(r, K) = 1，当且仅当 r 的至少一个 witness group 完全包含于 K
+covered(r, K) = 0，其他情况
+```
+
+强制义务完成度为：
+
+```text
+C(K) = 已完成的 mandatory obligations 数量 / mandatory obligations 总数
+```
+
+如果任务没有可靠的 mandatory obligation，则 `C(K)` 为 null，不能生成强 STOP 标签，相关状态标记为 `unknown`。
+
+### 14.4 Witness 进度
+
+只用完成度会把互补证据组的第一个证据错误标成零价值。因此同时保存进度：
+
+```text
+progress(r, K) = max_g |K ∩ g| / |g|
+P(K) = 所有 applicable obligations 的 progress 平均值
+```
+
+例如 witness group 为 `[caller, callee]`：
+
+- 两者都没有：进度为 0；
+- 只有其中一个：进度为 0.5；
+- 两者都有：进度为 1。
+
+数据集保存 `C` 和 `P` 两个原始分量，不把人为权重固化为唯一真值。
+
+### 14.5 动作增益
+
+对当前状态 `K` 和动作 `A`：
+
+```text
+completion_gain = C(K ∪ A) - C(K)
+progress_gain   = P(K ∪ A) - P(K)
+```
+
+训练需要单一排序值时，可以在 validation 上选择参数：
+
+```text
+utility = completion_gain + beta * progress_gain - gamma * token_cost
+```
+
+`beta` 和 `gamma` 属于训练配置或实验参数，不属于不可变 Gold。主要实验必须报告参数敏感性，并同时报告不扣成本和扣成本结果。
+
+### 14.6 关系标签
+
+关系优先由 witness graph 和确定性结构得到：
+
+| 关系 | 判定原则 |
+|------|----------|
+| `complement` | 位于同一 AND group，任一单证据无法完成该义务 |
+| `substitute` | 位于同一义务的不同 group，任一 group 都能独立满足义务 |
+| `redundant` | 内容相同、区间包含、高度重叠或相同语义的重复表示 |
+| `independent` | 分别推进不同义务，且不存在明显交互 |
+| `conflict` | 版本、行为或约束指向矛盾结论 |
+| `unknown` | 现有证据不足以可靠判断 |
+
+候选共现、共同被轨迹读取或同时属于 Gold context，只能用于产生 pair 候选，不能直接决定 `complement`。
+
+### 14.7 严格 STOP
+
+STOP 使用已确认的严格规则：
+
+```text
+全部 mandatory obligations 已完成 -> STOP 可接受
+任一 mandatory obligation 未完成   -> STOP 不可接受
+义务定义或覆盖关系不可靠             -> STOP unknown
+```
+
+可选义务和 `strong_support_untyped` 可以用于相关性或排序训练，但不允许单独阻止或允许 STOP。成功轨迹结束也不能覆盖这一规则。
+
+## 15. ContextBench 利用规则
+
+### 15.1 数据审计结果
+
+ContextBench 的每个 `gold_context` 项只有：
+
+```text
+file
+start_line
+end_line
+content
+```
+
+它没有义务类型、必要性、替代性或证据关系标签。严格对齐的 351 个任务实测如下：
+
+| 指标 | 数值 |
+|------|-----:|
+| Gold span 总数 | 2,207 |
+| 每任务平均 span | 6.29 |
+| 多 span 任务 | 349 |
+| 多文件任务 | 174 |
+| 存在区间重叠的任务 | 301 |
+| 存在包含关系的任务 | 244 |
+| 被其他 span 完全包含的 span | 398 |
+| 合并重叠后每任务平均区间 | 4.51 |
+| 与 patch 旧侧修改区间重叠的 span | 59.8% |
+| 同时包含非 patch 上下文的任务 | 261 |
+| 最大单 span 行数 | 880 |
+| 空内容 span | 5 |
+
+因此不能把每个 ContextBench span 直接当作一个 mandatory obligation。
+
+### 15.2 映射与归一化
+
+处理顺序如下：
+
+```text
+解析 gold_context
+-> 校验路径、行号和正文
+-> 映射修复前 snapshot
+-> 合并完全重复和包含区间
+-> 将过大区间切成 bounded Evidence Unit
+-> 映射义务或保留为 untyped strong support
+```
+
+映射规则：
+
+- 与 patch 旧侧修改区间重叠，可以支持 `fault_location`。
+- 与测试断言或问题预期行为一致，可以支持 `behavior_constraint` 或 `validation_constraint`。
+- 调用方、被调用方、导入定义可以支持 `dependency_context`。
+- 状态读写和参数传递可以支持 `state_flow`。
+- 无法可靠确定角色时标记为 `strong_support_untyped`，不得强制创建义务。
+- 区间重叠、包含或内容相同优先产生 `redundant`，不得产生强互补标签。
+
+ContextBench 决定“哪些区域是高质量证据候选”，不单独决定“任务有哪些证据义务”。
+
+## 16. SWE-Explore 利用规则
+
+### 16.1 字段语义
+
+SWE-Explore 官方定义中，`read_core` 是所有成功修复轨迹共同读取的区域，`optional` 是部分模型读取的诊断上下文。第一版使用方式如下：
+
+| 字段 | 用途 | 禁止解释 |
+|------|------|----------|
+| `read_core_regions` | 高置信度 witness 候选、定位正例 | 不能直接全部设为 mandatory |
+| `read_core_files` | 文件级候选召回 | 不能把整文件送入 Cross-Encoder |
+| `read_optional_regions_map` | 替代 witness、困难正例 | 不能当负例 |
+| `modified_core_files` | 离线构造 `fault_location` 和 `repair_scope` | 不能进入在线输入 |
+| `main_files` | 强故障位置锚点 | 不能代表完整证据集 |
+| `read_step_info` | 构造轨迹前缀和下一动作候选 | 不能证明语义必要性或 STOP |
+| `meta` | 仅作来源参考 | core 数量必须重新计算 |
+
+官方说明：https://github.com/Qiushao-E/SWE-Explore-Bench
+
+### 16.2 本地数据审计
+
+严格对齐的 451 个任务全部来自 SWE-Explore `verified`，每个任务有 3 条成功轨迹：
+
+| 指标 | 数值 |
+|------|-----:|
+| 平均 core 文件 | 3.29 |
+| 平均 core region | 3.33 |
+| 多 core region 任务 | 430 |
+| 多读取路径任务 | 432 |
+| 每条轨迹平均读取事件 | 16.52 |
+| 整文件读取事件比例 | 61.5% |
+| 存在 optional context 的任务 | 410 |
+
+`meta.num_read_core` 在 252/451 个任务中与实际数组长度不一致，`meta.num_read_core_regions` 在 253/451 个任务中不一致。构建器必须以真实数组为准，重新计算统计。
+
+### 16.3 监督强度
+
+```text
+SWE-Explore core ∩ ContextBench Gold
+    -> strong typed witness 候选
+
+SWE-Explore core ∩ patch/main file
+    -> strong fault_location witness 候选
+
+SWE-Explore core only
+    -> trajectory_consensus_support
+
+SWE-Explore optional
+    -> alternative_support
+
+只在 read_step_info 中出现
+    -> behavioral_support
+```
+
+283 个 ContextBench 与 SWE-Explore 交集任务提供最高质量的跨来源一致监督，但全部属于 benchmark，只能用于评测和标签校准，不能用于训练。
+
+### 16.4 轨迹前缀
+
+按 `traj_path` 分组并按 `step_idx` 排序读取事件：
+
+```text
+K0 = empty
+K1 = 第一次有效读取后状态
+K2 = 前两次有效读取后状态
+...
+```
+
+处理约束：
+
+- 合并对同一 Evidence Unit 的重复读取，保留 `first_step` 和 `visit_count`。
+- 有界读取映射到一个或多个 bounded Evidence Unit。
+- `end=-1` 的整文件读取只记录 `visited_file`，不展开为全部文件正文。
+- 实际下一读取是可接受动作之一，不是唯一正确动作。
+- 其他能够推进同一未完成义务的 witness 同样进入可接受动作集合。
+- 轨迹末尾只有在全部 mandatory obligations 已完成时才能产生正 STOP。
+
+## 17. 受约束教师标注
+
+### 17.1 采用范围
+
+教师标注只补足以下缺口：
+
+- ContextBench 或 SWE-Explore 证据无法确定语义角色；
+- SWE-bench train/dev 缺少完整义务图；
+- pair 无法区分互补、替代和独立；
+- 某状态没有可靠的可接受动作；
+- 需要构造跨文件困难正例或困难负例。
+
+不对 21,527 个任务和全仓库候选做无差别教师调用。候选必须先由 patch、ContextBench、SWE-Explore、Retriever 或结构关系缩小到有界集合。
+
+### 17.2 参考 Nips 的原则
+
+Nips 项目使用 LLM 对已有 Gold supporting evidence 做受限角色分类，再由程序根据覆盖增益和成本选择动作，而不是让 LLM 无约束地产生最终训练标签：
+
+- https://github.com/lmy020520/Nips/blob/da41359/scripts/rebuild_hotpotqa_targets_v2.py
+- https://github.com/lmy020520/Nips/blob/da41359/scripts/build_hotpotqa_teacher_select_v2.py
+
+本项目沿用“语义判断交给教师、数值标签交给程序”的边界。
+
+### 17.3 教师输入
+
+教师每次只接收一个任务的受控包：
+
+```text
+problem_statement
+候选 Evidence Unit 的路径、符号、行号和 bounded 正文
+候选之间的确定性结构关系
+ContextBench/SWE-Explore/patch/test 的离线来源信号
+固定义务类型、关系枚举和 JSON Schema
+```
+
+patch、test patch 和 Gold 信号只能用于离线标注，不得复制到 `input`、状态正文或候选正文。
+
+### 17.4 教师输出
+
+教师只能：
+
+- 从固定 7 种义务类型中选择；
+- 引用输入中真实存在的 `evidence_id`；
+- 使用 AND group 和 group 间 OR；
+- 从固定关系枚举中选择；
+- 输出 `unknown`；
+- 给出结构化置信度和简短依据。
+
+教师不得：
+
+- 创建新的代码正文或不存在的 Evidence Unit；
+- 直接给出最终 `C`、`P`、动作增益或 STOP；
+- 把未提供的仓库文件加入 witness；
+- 覆盖确定性冲突标签。
+
+### 17.5 一致性与验证
+
+每个难例进行 3 次独立判断：
+
+| 一致性 | 标签来源 | 处理 |
+|--------|----------|------|
+| 3/3 | `teacher_consensus_strong` | 通过规则验证后可进入 train |
+| 2/3 | `teacher_consensus` | 通过规则验证后降低权重进入 train |
+| 低于 2/3 | `unknown` | 不参与对应监督损失 |
+| 与确定性标签冲突 | `conflict` | 不覆盖规则，进入人工抽检 |
+
+程序验证至少包括：
+
+- 所有 Evidence Unit 存在且属于同一 snapshot；
+- 教师只能引用 Prompt 中提供的 ID；
+- AND group 不得由重复、包含或相同内容证据组成；
+- mandatory obligation 至少拥有一个有效 witness group；
+- 关系标签与 witness graph 一致；
+- 输出满足严格 JSON Schema；
+- Prompt、模型 revision、输入哈希和原始响应可从 SQLite 审计。
+
+### 17.6 Split 使用边界
+
+- train：允许规则验证后的教师共识标签。
+- validation：教师标签必须与确定性信号一致，或经过固定种子人工校准；teacher-only 状态不用于选择主要阈值。
+- benchmark：teacher-only 标签不进入主要指标，只能用于辅助分析；主要真值必须来自确定性规则、跨来源一致或人工确认。
+
+## 18. 状态与候选动作构造
+
+### 18.1 状态来源
+
+第一版支持 3 类状态：
+
+| 状态类型 | 构造方式 | 可信度 |
+|----------|----------|--------|
+| `initial` | `K = empty` | 确定性 |
+| `gold_prefix` | 按 witness 或可靠轨迹前缀逐步加入证据 | strong/support |
+| `controlled_corruption` | 从充分证据集中删除一个 witness 或加入已验证冗余项 | support |
+
+不得通过随机加入任意文件制造“困难状态”。受控扰动必须保留状态来源和被删除、加入的 Evidence Unit。
+
+### 18.2 候选池
+
+每个状态的候选池由以下来源并集组成：
+
+- 尚未获取的 witness；
+- SWE-Explore core/optional 映射单元；
+- 与当前状态或 patch anchor 有调用、导入、继承、读写关系的单元；
+- Retriever 在同一 snapshot 中返回的高分单元；
+- 已验证的重叠、替代、独立和冲突对照；
+- STOP。
+
+所有候选必须属于当前 `snapshot_id`。未被 Gold 选中只表示未知，只有满足明确反证规则的单元才能标为 hard negative。
+
+### 18.3 单证据与双证据动作
+
+每个状态先生成单证据动作，再从受控关系图生成有限的双证据动作。禁止对全部候选做 `O(n^2)` 枚举。
+
+双证据候选优先级：
+
+1. 同一 AND witness group。
+2. 同一义务的不同替代 group。
+3. caller/callee、writer/reader、implementation/test 等结构对。
+4. ContextBench/SWE-Explore 共现但关系尚未确认的 pair。
+5. 重叠、包含和内容重复的冗余对照。
+
+只有前 3 类在证据充分时可以产生强关系标签；第 4 类默认 `unknown`，除非教师共识或人工确认。
+
+### 18.4 可接受动作集合
+
+同一状态允许多个正确动作。义务尚未完成时，语义可接受条件为：
+
+```text
+acceptable(A | K) =
+    completion_gain > 0
+    或 completion_gain = 0 且 progress_gain > 0
+```
+
+若多个动作增益相同，Token 成本更低的动作优先，但高成本动作不能因此被错误标为语义负例。训练可以使用 set-valued listwise loss；数据集不强迫每个状态只有一个正动作。
+
+当 `C(K)=1` 时，上述证据动作规则停止适用，STOP 是唯一主要可接受动作。继续获取只覆盖可选义务或重复证据的动作必须标为不可接受，但可以保留其非负语义增益作为辅助分析。当 `C(K)` 为 null 时，STOP 和依赖义务覆盖的动作标签均设为 `unknown`。
+
+## 19. Cross-Encoder 输入与输出
+
+### 19.1 输入渲染
+
+Cross-Encoder 的逻辑输入为：
+
+```text
+[QUESTION]
+problem_statement
+
+[CURRENT EVIDENCE]
+K 中经过预算控制的证据摘要或最近证据正文
+
+[CANDIDATE ACTION]
+单个 Evidence Unit、两个 Evidence Unit，或 STOP 描述
+```
+
+初始状态可以只有问题和候选动作，此时 `K` 为空。系统先从 repository corpus 检索有限候选，再由 Cross-Encoder 排序；完整仓库不进入模型上下文。
+
+### 19.2 输出
+
+主输出是动作排序分数。辅助头可以预测：
+
+- `completion_gain`；
+- `progress_gain`；
+- pair relation；
+- STOP 可接受性。
+
+数据集同时支持：
+
+1. 单动作二分类或回归；
+2. 同一状态内的 listwise 排序；
+3. 关系分类辅助损失；
+4. STOP 分类辅助损失。
+
+第一版训练推荐按以下顺序：
+
+```text
+单证据初始状态预热
+-> 状态感知单证据排序
+-> 高置信度双证据微调
+-> STOP 与关系多任务校准
+```
+
+## 20. 质量评估与最小试验
+
+### 20.1 标签统计
+
+每次构建必须分别报告：
+
+```text
+independent_task_count
+state_count
+single_action_count
+pair_action_count
+candidate_count
+unique_snapshot_count
+unique_repo_count
+```
+
+禁止把状态数、pair 数或候选数表述为独立 SWE 任务数量。
+
+### 20.2 固定审计样本
+
+正式扩展教师标签前，先构造 320 个反事实证据包：
+
+```text
+20 个任务 × 4 个候选 pair × 4 个证据包
+```
+
+每个 pair 检查：
+
+```text
+K
+K + u
+K + v
+K + u + v
+```
+
+试验至少覆盖互补、替代、冗余和独立关系，并检查：
+
+- `completion_gain` 和 `progress_gain` 是否符合 witness graph；
+- 互补 pair 是否存在单独不完成、组合后完成的案例；
+- 替代证据在一个 group 已满足后，另一个 group 的边际价值是否下降；
+- 重复证据是否被错误赋予增益；
+- 教师一致率和规则拒绝率是否可接受；
+- 人工复核是否能依据原始证据重现标签。
+
+如果试验无法观察到稳定的正交互、替代衰减或严格 STOP，不能扩展 pair 数据，也不能把证据交互作为主要实验结论。
+
+### 20.3 发布前人工抽检
+
+固定随机种子抽检：
+
+- 100 个确定性或跨来源强监督任务；
+- 100 个教师共识训练任务；
+- 100 个跨文件 pair；
+- 100 个 `unknown`、冲突或规则拒绝任务。
+
+人工抽检记录只进入 SQLite 和 manifest 统计，不新增最终发布文件。
+
+## 21. 端到端数据流
+
+```text
+冻结 SWE-bench split
+-> 严格对齐 ContextBench 与 SWE-Explore
+-> 准备修复前 repository snapshot
+-> 构建唯一文件版本与 bounded Evidence Unit
+-> 映射 patch、ContextBench 和 SWE-Explore 信号
+-> 构建语义义务与 witness group
+-> 对缺口执行受约束教师标注
+-> 程序计算 C、P、动作增益、关系和 STOP
+-> 构造 train / validation / benchmark 状态与候选动作
+-> 完整性、泄漏和人工抽检
+-> 输出 JSONL 实验版或 Parquet 正式版
+```
+
+任何阶段失败时保留旧 release，从 SQLite 最近的兼容阶段继续。最终文件只在所有硬门槛通过后原子发布。
