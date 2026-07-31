@@ -510,7 +510,128 @@ unit_content = file_content_lines[start_line - 1:end_line]
 
 任何任务只能访问 `snapshot_ids` 包含自身 `snapshot_id`、且 `attributes.searchable=true` 的文件版本和 Evidence Unit。训练加载器可以在内存中建立 `snapshot_id → file_version_id` 索引，并展开 `evidence_units` 形成函数级候选；索引和展开结果都不是新的发布文件。
 
-## 9. `manifest.json`
+## 9. 单命令构建与状态管理
+
+### 9.1 用户接口
+
+完整数据集通过一条命令生成：
+
+```powershell
+python scripts/build_unified_dataset.py `
+  --config configs/unified_swe_v1.json
+```
+
+用户可见输入：
+
+```text
+data/raw/
+data/cache/repos/
+configs/unified_swe_v1.json
+```
+
+唯一构建状态文件：
+
+```text
+data/.build/unified_swe_v1.sqlite3
+```
+
+最终发布目录：
+
+```text
+data/unified_swe_dataset_v1/
+├── train.parquet
+├── validation.parquet
+├── benchmark.parquet
+├── repository_corpus.parquet
+└── manifest.json
+```
+
+构建过程不得再生成 `normalized_instances.jsonl`、`master_instances.jsonl`、`split_assignments.jsonl`、`candidate_files.jsonl`、`evidence_units.jsonl` 或 `certification_labels.jsonl` 等独立中间产物。
+
+### 9.2 SQLite 状态表
+
+单个 SQLite 状态库至少包含：
+
+```text
+source_records
+canonical_tasks
+task_aliases
+supervision
+trajectories
+split_assignments
+snapshots
+file_versions
+snapshot_file_memberships
+evidence_units
+conflicts
+build_phases
+```
+
+SQLite 只承担规范化、关联、断点和审计状态，不属于最终发布数据。文件正文可以存储在 `file_versions` 中，也可以在本地 Git blob 可用时仅保存 `blob_oid` 和提取状态；无论采用哪种方式，最终内容必须从已校验的 Git blob 生成。
+
+### 9.3 内部阶段
+
+单次命令按以下阶段执行：
+
+```text
+校验原始来源和哈希
+→ 来源专用规范化
+→ 任务身份合并
+→ train / validation / benchmark 切分
+→ Git snapshot 校验
+→ 唯一文件版本和成员关系枚举
+→ Evidence Unit 提取
+→ 监督与轨迹映射
+→ 流式写入临时 Parquet
+→ 完整性审计
+→ 原子发布
+```
+
+每个阶段在 `build_phases` 中记录：
+
+- 阶段名称和版本；
+- 输入指纹；
+- 开始、完成和失败时间；
+- 已处理数量；
+- 输出表行数；
+- 错误摘要；
+- 是否可以断点续跑。
+
+输入指纹或阶段版本变化时，只使受影响阶段及其下游失效，不得静默复用不兼容状态。
+
+### 9.4 临时文件和原子发布
+
+Parquet 使用分批 row group 流式写入，不要求将完整数据载入内存。构建器先写入：
+
+```text
+data/unified_swe_dataset_v1.tmp/
+├── train.parquet
+├── validation.parquet
+├── benchmark.parquet
+├── repository_corpus.parquet
+└── manifest.json
+```
+
+只有 5 个文件全部通过发布硬门槛后，才将临时目录原子替换为正式目录。失败时：
+
+- 已发布的旧版本保持不变；
+- 临时目录不得被标记为 release；
+- 下次从 SQLite 中最近的兼容阶段继续；
+- 已完成的 Git inventory 和 Evidence Unit 提取不得无条件重跑。
+
+### 9.5 状态清理
+
+构建成功后默认保留 SQLite，便于复现和增量更新。用户可以显式删除：
+
+```powershell
+python scripts/build_unified_dataset.py `
+  --config configs/unified_swe_v1.json `
+  --clean-state
+```
+
+`--clean-state` 只能在正式目录完成哈希复核后执行。删除状态库不影响 5 个发布文件，但下一次构建必须从头开始。
+
+## 10. `manifest.json`
 
 `manifest.json` 至少记录：
 
@@ -527,7 +648,7 @@ unit_content = file_content_lines[start_line - 1:end_line]
 - 文件和 Evidence Unit 引用完整率；
 - 构建命令、随机种子和工具版本。
 
-## 10. 发布硬门槛
+## 11. 发布硬门槛
 
 以下任一条件不满足时禁止发布：
 
@@ -544,11 +665,15 @@ unit_content = file_content_lines[start_line - 1:end_line]
 - manifest 文件哈希与实际文件不一致；
 - 高严重度身份冲突进入任一任务文件；
 - benchmark 的 split 或 membership 未冻结。
+- 任何临时文件或未完成阶段被标记为正式 release。
 
-## 11. 已确认决策
+## 12. 已确认决策
 
-- 中间数据使用 JSONL，正式发布使用 Parquet。
+- 原始来源保留自身格式；内部派生状态统一存入单个 SQLite，正式发布使用 Parquet。
 - 最终发布包含 5 个文件。
+- 完整数据集由一条命令生成。
+- 构建过程只保留一个可断点续跑的 SQLite 状态库，不发布独立中间 JSONL。
+- 5 个最终文件通过临时目录流式生成，并在完整性审计后原子发布。
 - train、validation、benchmark 提前物理分开。
 - 三个任务文件共用同一个 Schema。
 - 使用 `input` 与 `supervision` 隔离模型输入和答案。
