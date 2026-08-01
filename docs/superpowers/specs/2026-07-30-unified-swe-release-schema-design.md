@@ -253,7 +253,10 @@ unified_swe_dataset_v1/
 | `token_cost` | int32 | 加入状态的正文 Token 数 |
 | `relation` | string | `complement`、`substitute`、`redundant`、`independent`、`conflict` 或 `unknown` |
 | `covered_obligation_ids` | list\<string> | 动作完成或推进的义务 |
-| `acceptable` | bool | 是否属于当前状态的可接受动作集合 |
+| `semantic_useful` | bool | 动作是否对 `C` 或 `P` 产生正语义增益；标签未知时为 null |
+| `policy_acceptable` | bool | 动作是否属于当前状态下值得执行的非支配动作集合；标签未知时为 null |
+| `pareto_dominated` | bool | 证据动作是否被同状态中的其他证据动作 Pareto 支配；STOP 为 null |
+| `dominated_by_action_ids` | list\<string> | 严格支配当前动作的同状态动作 ID；不可判定时为空列表 |
 | `label_source` | string | 规则、跨来源、轨迹、教师共识或人工 |
 | `confidence` | float32 | 动作标签置信度 |
 | `relation_loss_mask` | bool | 是否参与关系分类损失 |
@@ -1120,8 +1123,9 @@ K2 = 前两次有效读取后状态
 - 合并对同一 Evidence Unit 的重复读取，保留 `first_step` 和 `visit_count`。
 - 有界读取映射到一个或多个 bounded Evidence Unit。
 - `end=-1` 的整文件读取只记录 `visited_file`，不展开为全部文件正文。
-- 实际下一读取是可接受动作之一，不是唯一正确动作。
-- 其他能够推进同一未完成义务的 witness 同样进入可接受动作集合。
+- 实际下一读取只提供 `semantic_useful` 的行为支持，不能自动视为 `policy_acceptable=true`。
+- 其他能够推进同一未完成义务的 witness 同样进入有用动作集合，再通过 Pareto 判断形成策略可接受集合。
+- 若实际读取被更低成本且增益不低的动作支配，保留轨迹 provenance，但不能把被支配动作作为主要排序正例。
 - 轨迹末尾只有在全部 mandatory obligations 已完成时才能产生正 STOP。
 
 ## 17. 受约束教师标注
@@ -1133,7 +1137,7 @@ K2 = 前两次有效读取后状态
 - ContextBench 或 SWE-Explore 证据无法确定语义角色；
 - SWE-bench train/dev 缺少完整义务图；
 - pair 无法区分互补、替代和独立；
-- 某状态没有可靠的可接受动作；
+- 某状态没有可靠的 `policy_acceptable` 动作；
 - 需要构造跨文件困难正例或困难负例。
 
 不对 21,527 个任务和全仓库候选做无差别教师调用。候选必须先由 patch、ContextBench、SWE-Explore、Retriever 或结构关系缩小到有界集合。
@@ -1247,19 +1251,50 @@ patch、test patch 和 Gold 信号只能用于离线标注，不得复制到 `in
 
 只有前 3 类在证据充分时可以产生强关系标签；第 4 类默认 `unknown`，除非教师共识或人工确认。
 
-### 18.4 可接受动作集合
+### 18.4 语义有用性与策略可接受性
 
-同一状态允许多个正确动作。义务尚未完成时，语义可接受条件为：
+动作标签必须区分“提供信息”和“当前值得执行”。`semantic_useful` 只描述动作相对于当前状态 `K` 是否产生语义增益：
 
 ```text
-acceptable(A | K) =
+semantic_useful(A | K) =
     completion_gain > 0
     或 completion_gain = 0 且 progress_gain > 0
 ```
 
-若多个动作增益相同，Token 成本更低的动作优先，但高成本动作不能因此被错误标为语义负例。训练可以使用 set-valued listwise loss；数据集不强迫每个状态只有一个正动作。
+`semantic_useful=true` 不等于动作应被模型优先选择。例如，替代证据 `[u]` 已能完成某个义务时，`[u, v]` 仍具有正语义增益，但如果没有比 `[u]` 完成更多内容，就不应为重复正文支付额外 Token 成本。
 
-当 `C(K)=1` 时，上述证据动作规则停止适用，STOP 是唯一主要可接受动作。继续获取只覆盖可选义务或重复证据的动作必须标为不可接受，但可以保留其非负语义增益作为辅助分析。当 `C(K)` 为 null 时，STOP 和依赖义务覆盖的动作标签均设为 `unknown`。
+对于同一状态中的两个非 STOP 证据动作 `A` 和 `B`，若满足：
+
+```text
+completion_gain(B) >= completion_gain(A)
+progress_gain(B)   >= progress_gain(A)
+token_cost(B)      <= token_cost(A)
+```
+
+且至少一项严格不等，则 `B` Pareto 支配 `A`。此时：
+
+```text
+pareto_dominated(A) = true
+dominated_by_action_ids(A) 包含 B.action_id
+```
+
+证据尚不充分，即 `C(K) < 1` 时：
+
+```text
+policy_acceptable(A | K) =
+    semantic_useful(A | K)
+    且 pareto_dominated(A) = false
+```
+
+同一状态允许多个非支配正确动作，数据集不强迫只有一个正动作。Pareto 判断不预设 `beta` 和 `gamma`，因此不会在构造 Gold 时提前固定信息增益与 Token 成本之间的标量权衡；训练阶段可以使用 validation split 选择这些系数。
+
+STOP 不参与证据动作之间的 Pareto 比较。严格 STOP 规则优先于上述公式：
+
+- `C(K) < 1`：STOP 的 `policy_acceptable=false`；
+- `C(K) = 1`：STOP 的 `policy_acceptable=true`，所有继续获取证据的动作均为 false；
+- `C(K)` 无法可靠计算：相关策略标签为 null，后续通过损失掩码排除。
+
+STOP 不增加语义证据，因此在可判定状态下固定为 `semantic_useful=false`，`pareto_dominated=null`。证据动作即使因成本被支配，也必须保留其真实 `semantic_useful`，不能被错误改写为语义负例。
 
 ## 19. 唯一训练模型：Cross-Encoder Evidence Policy Ranker
 
