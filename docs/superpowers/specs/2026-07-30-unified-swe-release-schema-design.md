@@ -58,7 +58,7 @@ unified_swe_dataset_v1/
 | 文件 | 一行表示 | 用途 |
 |------|----------|------|
 | `train.parquet` | 一个可训练的统一任务 | 参数训练、行为模仿、弱监督预训练 |
-| `validation.parquet` | 一个冻结的验证任务 | 调参、早停、阈值选择、回归验证 |
+| `validation.parquet` | 一个冻结的验证任务 | 计算 validation loss、早停、检查点选择和回归验证 |
 | `benchmark.parquet` | 一个正式评测任务 | 证据检索、充分性判断、代码修复评测 |
 | `repository_corpus.parquet` | 一个唯一文件版本 | 保存正文、快照成员关系及嵌套 Evidence Unit |
 | `manifest.json` | 整个发布版本的元数据 | Schema、来源、哈希、统计和审计 |
@@ -237,7 +237,7 @@ unified_swe_dataset_v1/
 | `progress_score` | float32 | 当前 witness 进度 `P(K)` |
 | `candidate_actions` | list\<struct> | 单证据、双证据和 STOP 动作 |
 | `stop_label` | string | `positive`、`negative` 或 `unknown` |
-| `stop_loss_mask` | bool | STOP 标签是否可参与训练与主要指标 |
+| `stop_loss_mask` | bool | STOP 标签是否可参与训练或 validation loss |
 | `ranking_loss_mask` | bool | 当前状态是否具备可计算 listwise loss 的已知正、负动作 |
 | `label_source` | string | 状态及动作标签的构造来源 |
 | `confidence` | float32 | 状态级标签置信度 |
@@ -314,14 +314,12 @@ unified_swe_dataset_v1/
 
 ### 3.6 `evaluation`
 
-`evaluation` 是可空 struct。`validation.parquet` 和 `benchmark.parquet` 必填；`train.parquet` 默认为 null。
+`evaluation` 是可空 struct。只有 `benchmark.parquet` 必填；`train.parquet` 和 `validation.parquet` 固定为 null。validation loss 直接读取 `supervision`，不需要评测配置。
 
 | 子字段 | 类型 | 含义 |
 |--------|------|------|
 | `benchmark_memberships` | list\<struct> | 上游评测集身份 |
 | `targets` | list\<string> | 可评测能力 |
-| `primary_metric` | string | 主要选择或报告指标 |
-| `metrics` | list\<string> | 可计算指标 |
 | `gold_visibility` | string | `evaluator_only` 或 `private` |
 | `timeout_seconds` | int32 | 单任务最大执行时间 |
 | `execution_required` | bool | 是否必须运行测试环境 |
@@ -407,7 +405,7 @@ unified_swe_dataset_v1/
 
 ### 5.1 用途
 
-`validation.parquet` 用于调参、早停、阈值选择和回归验证，不参与参数训练。
+`validation.parquet` 用于计算 validation loss、早停、检查点选择和回归验证，不参与参数训练。validation 使用与训练相同的带掩码损失定义；损失权重属于训练配置，不写入数据集 Schema。最终选择 validation loss 最低的检查点，不在数据集内固化额外评测指标或 STOP 阈值。
 
 ### 5.2 字段约束
 
@@ -417,10 +415,9 @@ unified_swe_dataset_v1/
 | `split_info.trainable` | 固定为 `false` |
 | `supervision.level` | 只能是 `strong` 或 `support` |
 | `trajectories` | 固定为空数组 |
-| `evaluation` | 必填 |
-| `evaluation.gold_visibility` | 固定为 `evaluator_only` |
+| `evaluation` | 固定为 null |
 
-模型只能读取 `input` 和 `snapshot_id`。Evaluator 可以读取 `supervision` 和 `evaluation`。
+模型只能读取 `input` 和 `snapshot_id`。validation loss 构造器可以读取 `supervision`，但不得把监督字段传入模型。
 
 ### 5.3 切分要求
 
@@ -430,7 +427,7 @@ unified_swe_dataset_v1/
 - ContextBench、SWE-Explore 和教师派生标签必须继承对应 SWE-bench 任务的 split，不得重新随机切分。
 - 同一 `task_group_id`、Issue、PR 或派生变体不得跨 split。
 - train、validation 和 benchmark 在任何标签生成、教师调用和候选挖掘之前冻结。
-- benchmark 任务及其标签不得参与模型参数更新、阈值拟合或困难负例挖掘。
+- benchmark 任务及其标签不得参与模型参数更新、检查点选择、损失权重选择或困难负例挖掘。
 
 当前冻结来源的强监督分布为：train 中 38 个 ContextBench Poly 对齐任务；benchmark 中 313 个 ContextBench Verified 对齐任务和 451 个 SWE-Explore Verified 对齐任务。由于大部分跨来源强标签位于 benchmark，教师标注的主要用途是补足 train 和 validation，而不是把 benchmark 数据迁移到 train。
 
@@ -444,7 +441,7 @@ validation 直接使用 1,800 个通过程序约束的唯一教师包，不再�
 
 教师只判断义务、Witness Group 和义务级 pair 关系。程序仍根据教师语义图统一计算 `C`、`P`、动作增益、Pareto、STOP、聚合关系目标和损失掩码。只有满足第 17.5 节全部约束并记录为 `teacher_verified` 的标签才能进入 validation；语义冲突、非法引用和规则拒绝结果转为 `unknown` 或从损失中屏蔽，并从相同任务、状态和关系分层补入替代包，直到有效数量达到 1,800。
 
-这些 `teacher_verified` 标签允许用于主要 validation 指标、早停、`beta`、`gamma`、`lambda_relation` 和 STOP 阈值选择。其局限是 validation 衡量的主要是学生模型与教师语义策略的一致性，可能继承教师的系统性偏置。为隔离该偏置，benchmark 主要真值继续禁止使用 teacher-only 标签，最终研究结论必须以冻结 benchmark 的确定性、跨来源或人工真值为准。
+这些 `teacher_verified` 标签允许进入 validation loss，并据此执行早停和检查点选择。其局限是 validation loss 衡量的主要是学生模型与教师语义策略的一致性，可能继承教师的系统性偏置。为隔离该偏置，benchmark Gold 继续禁止使用 teacher-only 标签，最终研究结论必须以冻结 benchmark 的确定性、跨来源或人工真值为准。
 
 ## 6. `benchmark.parquet`
 
@@ -463,21 +460,21 @@ validation 直接使用 1,800 个通过程序约束的唯一教师包，不再�
 | `evaluation.benchmark_memberships` | 至少包含 1 项 |
 | `split_info.split_reason` | 必须说明上游评测身份或冻结策略 |
 
-评测轨道：
+benchmark 保存的评测目标：
 
-| 轨道 | 主要来源 | 主要指标 |
-|------|----------|----------|
-| 代码修复 | SWE-bench test | `patch_resolved`、测试通过率 |
-| 证据定位 | ContextBench、SWE-Explore、patch 派生位置 | Recall@K、MRR、nDCG |
-| 证据充分性 | ContextBench、SWE-Explore、人工审核样本 | obligation coverage、STOP accuracy |
-| 证据交互 | witness group 与人工审核样本 | multi-label pair relation F1、pair utility ranking |
+| 评测目标 | 主要来源 | Evaluator 可用真值 |
+|----------|----------|--------------------|
+| 代码修复 | SWE-bench test | patch、test patch 和可执行环境 |
+| 证据定位 | ContextBench、SWE-Explore、patch 派生位置 | Gold Evidence Unit |
+| 证据充分性 | ContextBench、SWE-Explore、人工审核样本 | obligation 和 Witness Group |
+| 证据交互 | Witness Group 与人工审核样本 | 义务级 pair relation |
 
 所有证据类评测必须分别报告两种候选模式：
 
 - `oracle_candidate_ranking`：向候选池注入缺失 Gold，只评估唯一 Cross-Encoder 对已给定候选的排序、组合与 STOP 能力；
 - `end_to_end_online`：候选只能由问题、当前证据和 pre-fix 仓库生成，不允许 Gold 注入，用于评估规则召回与 Cross-Encoder 组成的完整系统。
 
-两个模式必须分别报告样本数和指标，不得用 Oracle 候选结果代替端到端结果。
+两个模式必须分别输出预测结果和样本数，不得用 Oracle 候选结果代替端到端结果。具体实验指标由独立 Evaluator 根据研究问题计算，不属于数据集 Schema，也不写入任务记录。
 
 ### 6.3 Gold 发布策略
 
@@ -503,7 +500,7 @@ validation 直接使用 1,800 个通过程序约束的唯一教师包，不再�
 | `provenance` | 必填 | 必填 | 必填 |
 | `supervision` | 必填 | 必填 | 内部版必填，公开版脱敏 |
 | `trajectories` | 可非空 | 空数组 | 空数组 |
-| `evaluation` | null | 必填 | 必填 |
+| `evaluation` | null | null | 必填 |
 | `split_info.trainable` | true | false | false |
 | `split_info.frozen` | true | true | true |
 | Gold 对模型可见 | 否 | 否 | 否 |
@@ -822,14 +819,14 @@ python scripts/build_unified_dataset.py `
 - 模型可见输入中包含 Gold；
 - validation 或 benchmark 存在轨迹；
 - validation 有效教师包数量不等于 1,800，或没有完整覆盖 225 个 dev 任务各 2 个状态、每状态 4 个困难 pair；
-- 任一进入 validation 损失或主要指标的教师标签未通过第 17.5 节程序验证；
+- 任一进入 validation loss 的教师标签未通过第 17.5 节程序验证；
 - benchmark 任务或派生任务进入 train；
 - 任一 mandatory obligation 没有可解析的 witness group；
 - 任一正 STOP 状态仍存在未完成的 mandatory obligation；
 - 任一负 STOP 状态已经完成全部 mandatory obligations；
 - 重复、包含或相同内容证据被标成强 `complement`；
 - 教师输出引用不存在、跨 snapshot 或未提供给教师的 `evidence_id`；
-- teacher-only 标签进入 benchmark 主要指标；
+- teacher-only 标签被用作 benchmark Gold；
 - ContextBench overlay 被重复计为新任务；
 - SWE-Explore 的 `meta.num_read_core` 被用作真实列表长度；
 - SWE-Explore 的整文件读取被无界展开成 Cross-Encoder 正文；
@@ -1249,8 +1246,8 @@ API 超时、空响应、截断或 JSON 解析失败属于技术失败，可以�
 ### 17.6 Split 使用边界
 
 - train：允许规则验证后的单次教师标签。
-- validation：直接使用 1,800 个通过程序约束的 `teacher_verified` 包，允许用于主要指标、早停和超参数选择；程序从教师语义图重算全部派生标签。
-- benchmark：teacher-only 标签不进入主要指标，只能用于辅助分析；主要真值必须来自确定性规则、跨来源一致或人工确认。
+- validation：直接使用 1,800 个通过程序约束的 `teacher_verified` 包计算 validation loss，并用于早停和检查点选择；程序从教师语义图重算全部派生标签。
+- benchmark：teacher-only 标签不能作为 Gold，只能用于辅助分析；benchmark Gold 必须来自确定性规则、跨来源一致或人工确认。
 
 ### 17.7 最终教师标注规模
 
@@ -1261,7 +1258,7 @@ API 超时、空响应、截断或 JSON 解析失败属于技术失败，可以�
 | train 主标注 | 12,000 | 1,500 个分层抽样任务 × 2 个关键状态 × 4 个困难 pair |
 | validation 主标注 | 1,800 | 225 个 dev 任务 × 2 个关键状态 × 4 个困难 pair；通过程序约束后直接使用 |
 | train 稀有关系补充 | 1,200 | 定向补充 conflict、跨文件 complement 和难区分的 substitute/redundant |
-| benchmark 主要真值 | 0 | 禁止 teacher-only 标签进入主要 benchmark 指标 |
+| benchmark Gold | 0 | 禁止 teacher-only 标签成为 benchmark Gold |
 | 合计 | 15,000 | 不含 API 技术失败重试 |
 
 15,000 表示最终被接受的唯一标注样本数，不是 API 请求上限。若某个包无法通过引用、快照或 JSON 校验，必须从相同 repository、obligation 类型和关系缺口分层中补入替代包，直到有效样本数达到 15,000。教师包可以输出同一 pair 针对多个 obligation 的关系记录，因此最终义务级关系记录数可以高于 15,000。
@@ -1377,7 +1374,7 @@ policy_acceptable(A | K) =
     且 pareto_dominated(A) = false
 ```
 
-同一状态允许多个非支配正确动作，数据集不强迫只有一个正动作。Pareto 判断不预设 `beta` 和 `gamma`，因此不会在构造 Gold 时提前固定信息增益与 Token 成本之间的标量权衡；训练阶段可以使用 validation split 选择这些系数。
+同一状态允许多个非支配正确动作，数据集不强迫只有一个正动作。Pareto 判断不预设 `beta` 和 `gamma`，因此不会在构造 Gold 时提前固定信息增益与 Token 成本之间的标量权衡；这些系数属于训练实验配置，不属于数据集 Schema。
 
 STOP 不参与证据动作之间的 Pareto 比较。严格 STOP 规则优先于上述公式：
 
@@ -1621,7 +1618,7 @@ scoreable_unit_max_tokens = 1024
 
 `problem_statement` 原文始终完整保存在 `input.problem_statement`。当问题编码不超过 2,048 Token 时原样进入模型；超过时，模型视图保留前 1,536 Token、固定标记 `[TRUNCATED_MIDDLE]`，再用剩余预算保留尾部，保证特殊 Token 和标记计入后问题视图不超过 2,048。完整长度、模型视图长度和裁剪状态分别写入 `quality.problem_token_count`、`quality.model_question_token_count` 和 `quality.question_truncated`。
 
-候选动作 `A` 不允许裁掉正文。单个候选 Evidence Unit 的完整渲染长度不得超过 1,024；超长 class、function、代码区域和窗口必须先按方法、语法块或固定窗口继续拆分。双证据动作必须同时完整包含两段 Evidence Unit。若完整 `(q, K, A)` 超过 4,096，应继续拆分证据单元；仍无法满足时保留该动作供数据审计，但设置 `scoreable=false`、`action_loss_mask=false`，不得送入模型训练、阈值选择或主要指标。
+候选动作 `A` 不允许裁掉正文。单个候选 Evidence Unit 的完整渲染长度不得超过 1,024；超长 class、function、代码区域和窗口必须先按方法、语法块或固定窗口继续拆分。双证据动作必须同时完整包含两段 Evidence Unit。若完整 `(q, K, A)` 超过 4,096，应继续拆分证据单元；仍无法满足时保留该动作供数据审计，但设置 `scoreable=false`、`action_loss_mask=false`，不得送入模型训练、validation loss 或 benchmark Evaluator。
 
 训练和推理使用同一渲染函数、Tokenizer revision 和特殊标记。DataLoader 必须令 Tokenizer 的自动截断失效，并先断言 `model_input_token_count <= 4096`；任何依赖 `truncation=true` 静默修剪候选正文的实现都属于发布阻断错误。
 
@@ -1659,7 +1656,7 @@ A_star = argmax_A score(q, K, A)
 L_total = L_rank + lambda_relation * L_relation
 ```
 
-`L_relation` 使用带掩码的多标签 Binary Cross-Entropy，只在拥有可靠义务级关系标签的双证据动作及 `relation_loss_masks.<class>=true` 的类别上计算。`lambda_relation` 由 validation split 选择，不能使用 benchmark 调参。
+`L_relation` 使用带掩码的多标签 Binary Cross-Entropy，只在拥有可靠义务级关系标签的双证据动作及 `relation_loss_masks.<class>=true` 的类别上计算。`lambda_relation` 属于训练配置；训练和 validation 必须使用同一取值，benchmark 不参与选择。
 
 训练按同一个模型检查点逐步加入更难样本，不在各阶段分别训练不同模型：
 
