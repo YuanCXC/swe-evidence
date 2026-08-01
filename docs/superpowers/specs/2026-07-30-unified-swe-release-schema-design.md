@@ -434,6 +434,24 @@ unified_swe_dataset_v1/
 
 当前冻结来源的强监督分布为：train 中 38 个 ContextBench Poly 对齐任务；benchmark 中 313 个 ContextBench Verified 对齐任务和 451 个 SWE-Explore Verified 对齐任务。由于大部分跨来源强标签位于 benchmark，教师标注的主要用途是补足 train 和 validation，而不是把 benchmark 数据迁移到 train。
 
+### 5.4 全量人工校准
+
+validation 不直接使用 teacher-only 语义标签选择主要阈值。最终构建对全部 225 个 SWE-bench dev 任务执行一次任务级人工校准，不抽样，也不把 1,800 个教师包分别作为 1,800 次孤立审核。
+
+构建器先把同一任务的 8 个教师包合并为 1 份稳定排序的校准单，共生成 225 份。每份校准单包含：
+
+- 完整问题描述，以及教师实际看到的 Evidence Unit；
+- 合并去重后的义务、mandatory 属性和 Witness Group；
+- 2 个关键状态、8 个困难 pair 及义务级关系判断；
+- patch、test、ContextBench、SWE-Explore 和确定性结构规则产生的离线依据；
+- 教师输出、程序冲突、未知项和规则拒绝原因。
+
+人工审核必须对每个义务、Witness Group 和唯一义务级 pair 关系执行 `confirm`、`correct` 或 `reject`。`reject` 不等于负标签：被拒绝且没有可靠反证的判断转为 `unknown`，对应损失 mask 为 false。人工审核不得直接填写 `completion_score`、`progress_score`、动作增益、Pareto、STOP 或损失掩码。
+
+225 份校准单全部完成后，程序从确认或纠正后的义务图重新计算所有 validation 状态的 `C`、`P`、动作增益、Pareto、STOP 和损失掩码。最终 validation 中可进入主要调参指标的标签来源只能是 `deterministic`、`cross_source` 或 `human`；未经人工确认的 `teacher_verified` 记录只保留为 provenance，不参与主要阈值、早停或超参数选择。
+
+人工校准结果仍写入统一 Schema：新增的 `label_provenance` 记录使用 `source=human`，`source_record_ids` 引用对应教师包和离线依据，`input_sha256` 对完整校准单计算。确认或纠正后的 obligation、witness 和 relation 引用该人工 `annotation_id`；教师原始标注不删除，保证能够审计人类修改了什么。
+
 ## 6. `benchmark.parquet`
 
 ### 6.1 用途
@@ -792,6 +810,7 @@ python scripts/build_unified_dataset.py `
 - 独立任务数、状态数、单证据动作数、双证据动作数和候选数；
 - 义务类型、witness group 大小、关系类别和 STOP 标签分布；
 - 教师模型、Prompt 版本、有效样本数、调用数量、技术重试率、规则拒绝率和人工抽检结果；
+- 225 份 validation 校准单的完成数，以及 confirm、correct、reject、unknown 和冲突数量；
 - 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
 - 冻结 Tokenizer 的名称、revision、输入渲染版本，以及模型、问题和 Evidence Unit 的 Token 上限；
 - 问题、Evidence Unit 和完整模型输入的 mean、p50、p90、p95、p99、max、裁剪率及不可评分率；
@@ -808,6 +827,8 @@ python scripts/build_unified_dataset.py `
 - `task_group_id` 跨 split；
 - 模型可见输入中包含 Gold；
 - validation 或 benchmark 存在轨迹；
+- validation 校准单数量不等于 225，或存在未完成人工校准的 dev 任务；
+- validation 主要指标、早停或超参数选择读取了仅有 `teacher_verified` 来源的标签；
 - benchmark 任务或派生任务进入 train；
 - 任一 mandatory obligation 没有可解析的 witness group；
 - 任一正 STOP 状态仍存在未完成的 mandatory obligation；
@@ -1234,7 +1255,7 @@ API 超时、空响应、截断或 JSON 解析失败属于技术失败，可以�
 ### 17.6 Split 使用边界
 
 - train：允许规则验证后的单次教师标签。
-- validation：教师标签必须与确定性信号一致，或经过固定种子人工校准；teacher-only 状态不用于选择主要阈值。
+- validation：1,800 个教师包按任务合并成 225 份校准单并全部经过人工确认；程序从校准后的语义图重算派生标签。teacher-only 标签不用于主要阈值、早停或超参数选择。
 - benchmark：teacher-only 标签不进入主要指标，只能用于辅助分析；主要真值必须来自确定性规则、跨来源一致或人工确认。
 
 ### 17.7 最终教师标注规模
@@ -1244,7 +1265,7 @@ API 超时、空响应、截断或 JSON 解析失败属于技术失败，可以�
 | 用途 | 唯一教师包 | 构造方式 |
 |------|-----------:|----------|
 | train 主标注 | 12,000 | 1,500 个分层抽样任务 × 2 个关键状态 × 4 个困难 pair |
-| validation 辅助标注 | 1,800 | 225 个 dev 任务 × 2 个关键状态 × 4 个困难 pair |
+| validation 待校准标注 | 1,800 | 225 个 dev 任务 × 2 个关键状态 × 4 个困难 pair；随后合并为 225 份任务级人工校准单 |
 | train 稀有关系补充 | 1,200 | 定向补充 conflict、跨文件 complement 和难区分的 substitute/redundant |
 | benchmark 主要真值 | 0 | 禁止 teacher-only 标签进入主要 benchmark 指标 |
 | 合计 | 15,000 | 不含 API 技术失败重试 |
@@ -1723,14 +1744,14 @@ K + u + v
 
 ### 20.3 发布前人工抽检
 
-固定随机种子抽检：
+第 5.4 节规定的 225 个 validation 任务属于全量校准，不计入抽检数量。完成全量校准后，再使用固定随机种子抽检其余数据：
 
 - 100 个确定性或跨来源强监督任务；
 - 100 个规则验证教师训练任务；
 - 100 个跨文件 pair；
 - 100 个 `unknown`、冲突或规则拒绝任务。
 
-人工抽检记录只进入 SQLite 和 manifest 统计，不新增最终发布文件。
+validation 的人工校准标签通过统一 `label_provenance` 进入 `validation.parquet`；其审核表和逐项操作日志保存在 SQLite。其余人工抽检记录只进入 SQLite 和 manifest 统计，不新增最终发布文件。
 
 ## 21. 端到端数据流
 
@@ -1742,6 +1763,7 @@ K + u + v
 -> 映射 patch、ContextBench 和 SWE-Explore 信号
 -> 构建语义义务与 witness group
 -> 对缺口执行受约束教师标注
+-> 将 validation 教师包合并为 225 份任务级校准单并完成人工校准
 -> 程序计算 C、P、动作增益、关系和 STOP
 -> 构造 train / validation / benchmark 状态与候选动作
 -> 完整性、泄漏和人工抽检
