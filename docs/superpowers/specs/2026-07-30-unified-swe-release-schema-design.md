@@ -259,7 +259,7 @@ unified_swe_dataset_v1/
 | `progress_gain` | float32 | 动作带来的 `P` 增量 |
 | `completion_interaction` | float32 | 双证据的完成度交互增益 `I_C`；单证据和 STOP 为 null |
 | `progress_interaction` | float32 | 双证据的 witness 进度交互增益 `I_P`；单证据和 STOP 为 null |
-| `token_cost` | int32 | 加入状态的正文 Token 数 |
+| `token_cost` | int32 | 动作新增 Evidence Unit 的 `rendered_token_count` 之和；已在 `K` 中的证据不重复计费 |
 | `model_input_token_count` | int32 | 按冻结渲染规则得到的完整 `(q, K, A)` Token 数 |
 | `rendered_state_body_evidence_ids` | list\<string> | 本次评分中正文实际进入 `K` 模型视图的 Evidence Unit；`K` 中其余证据仍保留元数据 |
 | `scoreable` | bool | 完整模型输入是否满足长度与可见性约束 |
@@ -813,6 +813,7 @@ python scripts/build_unified_dataset.py `
 - validation 教师包的有效数量、任务覆盖率、状态覆盖率、关系分布、unknown 数量和冲突数量；
 - train/dev 无证书任务的删除数量、原因分布和排序 ID 集合 SHA-256；
 - 在线候选生成器 revision、冻结融合规则、train 对齐 Evidence Unit 数量的 p95、由此计算的 `online_single_cap`、固定 pair 配额，以及各 split 的候选数和必要正例溢出分布；
+- 默认累计证据 Token 预算和唯一 Evidence Unit 上限；
 - 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
 - 冻结 Tokenizer 的名称、revision、输入渲染版本，以及模型、问题和 Evidence Unit 的 Token 上限；
 - 问题、Evidence Unit 和完整模型输入的 mean、p50、p90、p95、p99、max、裁剪率及不可评分率；
@@ -851,6 +852,9 @@ python scripts/build_unified_dataset.py `
 - 构建时使用的 Tokenizer 名称或 revision 与冻结值不一致；
 - 任一 `scoreable=true` Evidence Unit 的 `rendered_token_count` 大于 1,024；
 - 任一 `scoreable=true` 动作的 `model_input_token_count` 大于 4,096；
+- 任一非 STOP 动作的 `token_cost` 不等于其新增 Evidence Unit 的 `rendered_token_count` 之和；
+- 任一发布 `policy_state` 的累计证据成本超过 32,768 Token，或包含超过 64 个唯一 Evidence Unit；
+- Manifest 中的 `evidence_token_budget` 不是 32,768，或 `selected_evidence_unit_cap` 不是 64；
 - `online_single_cap` 不是仅根据 train 中具备可靠对齐证据的任务计算，或与 Manifest 记录值不一致；
 - 任一状态的 `candidate_scope=online` 单证据动作数超过 `online_single_cap`；
 - 任一状态存在超过 8 个常规 pair，或必要正 pair 超额但 `candidate_overflow=false`；
@@ -891,6 +895,7 @@ python scripts/build_unified_dataset.py `
 - 动作空间包含单证据、双证据和 STOP；双证据关系支持互补、替代、冗余、独立、冲突和未知。
 - 标签不足时使用受约束教师模型，但完成度、进度、动作增益和 STOP 始终由程序计算。
 - 在线候选采用固定问题基础召回与状态结构增量扩展；每次更新 `K` 后重建动作并由同一个 Cross-Encoder 重新评分。
+- 在线正常终止由 STOP 竞争决定，并使用 32,768 累计证据 Token 与 64 个唯一 Evidence Unit 作为系统安全边界。
 
 ## 13. 冻结数据源与实测规模
 
@@ -1730,6 +1735,37 @@ A_star = argmax_A score(q, K, A)
 ```
 
 若 `A_star` 为单证据或双证据，系统将对应 Evidence Unit 加入 `K`，然后再次调用同一个模型；若 `A_star = STOP`，证据获取结束。STOP 不是另一个二分类模型，而是与证据动作竞争的特殊动作。
+
+在线系统不能读取 obligation、witness、参考补丁或 `C(K)`；这些信息只用于离线监督。正常终止不设置额外分数阈值或 STOP 二分类器，固定由统一动作排序头的 argmax 决定。为防止 STOP 校准失败导致无界取证，系统同时设置两项 train-only 数据驱动的硬预算：
+
+```text
+evidence_token_budget = 32768
+selected_evidence_unit_cap = 64
+```
+
+32,768 与单次模型输入上限 4,096 含义不同：前者限制一个任务累计获取的 Evidence Unit 完整渲染成本，后者限制一次 `(q, K, A)` 的实际模型输入。`K` 可以保留全部已选证据的元数据，但正文仍按第 19.3.2 节的动态规则进入模型视图。
+
+预算只根据 train 对齐强监督确定。对 38 个 ContextBench train Gold 任务的完整内容执行保守分块：每块为冻结渲染保留路径、行号等结构标记，并保证 `rendered_token_count <= 1024`，不截顶、不丢正文。分块后累计完整渲染成本的 mean、p50、p90、p95 和 max 分别为 4,050.68、2,217、9,826、16,947 和 21,233；对 p95 做二次幂上取整得到 32,768。对应分块数量的 mean、p50、p90、p95 和 max 分别为 11.61、9、30、50 和 53。唯一 Evidence Unit 上限因此固定为 64，覆盖上述 train Gold 长尾。ContextBench test 和 SWE-Explore benchmark 标签只用于事后审计，不参与预算确定。
+
+每轮评分前，在线系统先删除满足任一条件的非 STOP 动作：
+
+```text
+accumulated_token_cost + action.token_cost > 32768
+|K union action.evidence_ids| > 64
+action.scoreable = false
+```
+
+其中 `accumulated_token_cost` 对 `K` 中唯一 Evidence Unit 的 `rendered_token_count` 求和；单证据动作的 `token_cost` 是新增单元成本，双证据动作是两个新增单元成本之和。Evidence Unit 不允许重复计费。系统先保留刷新后、尚未过滤的在线证据动作，并按下表从上到下判定强制终止；存在合法证据动作时才执行统一模型评分：
+
+| `termination_reason` | 条件 |
+|----------------------|------|
+| `candidate_exhausted` | 在线生成器没有产生尚未位于 `K` 的证据动作 |
+| `token_budget_exhausted` | 存在候选，但所有候选加入后都会超过 32,768 Token |
+| `unit_budget_exhausted` | 存在满足 Token 预算的候选，但 `K` 已包含 64 个唯一 Evidence Unit，或所有剩余动作都会使其超过 64 |
+| `no_scoreable_action` | 存在满足两项累计预算的候选，但均无法满足 4,096 单次模型输入约束 |
+| `model_stop` | 存在合法、可评分的证据动作，但 STOP 的统一排序分数最高 |
+
+强制终止时，STOP 是唯一可执行动作，但必须记录实际 `termination_reason`，不能记为 `model_stop`。终止原因属于系统预测日志和 Evaluator 输出，不新增任务文件字段。系统不再设置独立的最大步数：每个非 STOP 动作至少加入 1 个从未进入 `K` 的 Evidence Unit，因此 64 个唯一单元的上限已经保证循环有限。
 
 对于双证据动作，关系辅助头通过 5 个独立 Sigmoid 输出 complement、substitute、redundant、independent 和 conflict 的多标签概率。多个类别可以同时为真；unknown 通过目标值 null 和损失掩码表达，不作为第 6 个输出类别。关系输出用于辅助损失和评测，不替代主排序分数，也不单独决定动作。单证据和 STOP 不计算关系损失。
 
