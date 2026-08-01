@@ -27,6 +27,7 @@ unified_swe_dataset_v1/
 - SWE-bench 是唯一任务基准；外部来源必须可靠对齐到 SWE-bench，否则不下载、不合并、不发布。
 - 监督区分确定性标签、跨来源标签和教师伪标签，不把三者混成同等可信的 Gold。
 - Cross-Encoder 只读取有界 Evidence Unit，不读取整个仓库或不受控的完整文件正文。
+- 最终只训练并部署一个 Cross-Encoder Evidence Policy Ranker；候选召回、候选配对和动作选择规则不引入其他可训练模型。
 
 ### 1.1 研究目标
 
@@ -262,11 +263,10 @@ unified_swe_dataset_v1/
 
 允许的 `training_targets`：
 
-- `retrieval`
-- `reranking`
-- `evidence_policy`
+- `evidence_action_ranking`
 - `interaction_classification`
-- `stop_prediction`
+
+`evidence_action_ranking` 同时覆盖单证据、双证据和 STOP 的统一排序。`interaction_classification` 只表示同一模型关系辅助头的标签可用性。候选召回不是训练目标，STOP 也不作为独立模型或独立训练目标。
 
 补丁生成、测试生成和失败轨迹建模不属于本数据集第一版的训练目标。
 
@@ -353,7 +353,7 @@ unified_swe_dataset_v1/
 
 ### 4.1 用途
 
-`train.parquet` 用于模型参数训练。任务可以同时服务 Retriever、Reranker、Evidence Policy、关系分类和 STOP 预测，无需为不同训练目标复制任务行。
+`train.parquet` 用于唯一 Cross-Encoder Evidence Policy Ranker 的参数训练。关系标签可以作为同一模型的辅助监督；单证据、双证据和 STOP 必须由同一个动作排序头统一评分。Retriever 只使用不可训练的词法、路径、符号和仓库结构规则，不使用本文件训练第二个模型。
 
 ### 4.2 字段约束
 
@@ -1261,9 +1261,40 @@ acceptable(A | K) =
 
 当 `C(K)=1` 时，上述证据动作规则停止适用，STOP 是唯一主要可接受动作。继续获取只覆盖可选义务或重复证据的动作必须标为不可接受，但可以保留其非负语义增益作为辅助分析。当 `C(K)` 为 null 时，STOP 和依赖义务覆盖的动作标签均设为 `unknown`。
 
-## 19. Cross-Encoder 输入与输出
+## 19. 唯一训练模型：Cross-Encoder Evidence Policy Ranker
 
-### 19.1 输入渲染
+### 19.1 模型定义
+
+最终只训练一个面向软件仓库问题定位的、状态条件化且支持证据组合的 Cross-Encoder Evidence Policy Ranker。它不是代码生成模型，也不是只计算“问题—文件相关性”的静态 Reranker。模型学习在当前证据状态下，下一步应获取哪条证据、哪组证据，或者是否停止。
+
+模型的核心函数为：
+
+```text
+s_A = f_theta(q, K, A)
+```
+
+- `theta`：唯一一套可训练参数。
+- `q`：SWE-bench 问题描述。
+- `K`：当前已获取的有界证据集合。
+- `A`：单证据 `[u]`、双证据 `[u, v]` 或 `STOP`。
+- `s_A`：动作效用排序分数，分数越高表示当前越值得执行。
+
+模型采用预训练 Transformer Encoder 作为 Backbone，将 `q`、`K` 和 `A` 拼接后联合编码。Cross-Encoder 允许问题、已有证据和候选证据在同一注意力空间内交互，因此能够判断候选的增量价值，而不只是静态相关性。
+
+### 19.2 单模型约束
+
+“只训练一个模型”具有以下明确含义：
+
+- 只产生一套参数和一个最终检查点；
+- 单证据、双证据和 STOP 共用同一个 Backbone 与动作排序头；
+- 不训练独立 Retriever、pair 选择器、STOP 分类器或另一个 Evidence Policy；
+- 教师模型只参与离线标注，不属于训练产物或部署系统；
+- 候选召回、结构扩展和有限 pair 构造均为不可训练的确定性过程；
+- pair relation 辅助头与排序头共享 Backbone，保存在同一个检查点中，不构成第二个模型。
+
+`completion_gain`、`progress_gain`、Token 成本和严格 STOP 条件首先用于构造监督信号，不要求分别训练预测模型。最终决策始终以统一的动作效用分数为准。
+
+### 19.3 输入渲染
 
 Cross-Encoder 的逻辑输入为：
 
@@ -1272,38 +1303,78 @@ Cross-Encoder 的逻辑输入为：
 problem_statement
 
 [CURRENT EVIDENCE]
-K 中经过预算控制的证据摘要或最近证据正文
+K 中按固定顺序渲染的有界 Evidence Unit
 
 [CANDIDATE ACTION]
-单个 Evidence Unit、两个 Evidence Unit，或 STOP 描述
+单个 Evidence Unit、两个 Evidence Unit，或 [STOP]
 ```
 
-初始状态可以只有问题和候选动作，此时 `K` 为空。系统先从 repository corpus 检索有限候选，再由 Cross-Encoder 排序；完整仓库不进入模型上下文。
+初始状态为 `K = empty`，因此第一次评分等价于：
 
-### 19.2 输出
+```text
+f_theta(q, empty, A)
+```
 
-主输出是动作排序分数。辅助头可以预测：
+后续步骤必须显式输入 `K`，使同一候选在不同证据状态下可以得到不同分数。候选正文来自 `repository_corpus` 中长度受控的 Evidence Unit；完整仓库、Gold witness、参考补丁、测试答案和教师解释均不得进入在线模型输入。
 
-- `completion_gain`；
-- `progress_gain`；
-- pair relation；
-- STOP 可接受性。
+双证据动作 `[u, v]` 作为一个整体动作输入模型。训练时可以随机交换 `u` 与 `v` 的渲染顺序，但其规范化 `action_id` 不变，防止模型学习固定位置偏差。
 
-数据集同时支持：
+### 19.4 统一输出与动作选择
 
-1. 单动作二分类或回归；
-2. 同一状态内的 listwise 排序；
-3. 关系分类辅助损失；
-4. STOP 分类辅助损失。
+动作排序头对每个候选动作输出一个标量：
 
-第一版训练推荐按以下顺序：
+```text
+score(q, K, [u])
+score(q, K, [u, v])
+score(q, K, STOP)
+```
+
+同一状态下的所有动作必须由同一个模型分别评分。系统执行：
+
+```text
+A_star = argmax_A score(q, K, A)
+```
+
+若 `A_star` 为单证据或双证据，系统将对应 Evidence Unit 加入 `K`，然后再次调用同一个模型；若 `A_star = STOP`，证据获取结束。STOP 不是另一个二分类模型，而是与证据动作竞争的特殊动作。
+
+对于双证据动作，关系辅助头同时输出 complement、substitute、redundant、independent、conflict 或 unknown 的关系分布。该分布用于辅助损失和关系评测，不替代主排序分数，也不单独决定动作。单证据和 STOP 不计算关系损失。
+
+### 19.5 训练方式
+
+训练样本按状态组织，而不是把每个候选当成互不相关的全局二分类样本。一个状态包含相同的 `(q, K)` 和多个候选动作：
+
+```text
+(q, K, {A_1, A_2, ..., A_n})
+```
+
+主目标是在同一状态内提高有增量价值动作的分数，降低无关、冗余、冲突动作和过早 STOP 的分数；证据充分时则提高 STOP 的分数。一个状态允许存在多个正确动作，因此主损失采用支持多正例的 listwise ranking loss。关系分类作为辅助损失，与排序任务共享同一个 Backbone：
+
+```text
+L_total = L_rank + lambda_relation * L_relation
+```
+
+`L_relation` 只在拥有高置信度关系标签的双证据动作上计算；其余动作通过 `relation_loss_mask=false` 屏蔽。`lambda_relation` 由 validation split 选择，不能使用 benchmark 调参。
+
+第一版训练按同一个模型检查点逐步加入更难样本，不在各阶段分别训练不同模型：
 
 ```text
 单证据初始状态预热
 -> 状态感知单证据排序
--> 高置信度双证据微调
--> STOP 与关系多任务校准
+-> 高置信度双证据动作
+-> STOP 与关系联合校准
 ```
+
+### 19.6 模型与外围系统的边界
+
+模型只输出候选动作分数和可选的 pair relation 分布。以下工作属于外围系统，不属于模型本身：
+
+- 从仓库语料中生成初始候选；
+- 根据路径、符号、导入和调用关系扩展候选；
+- 从高优先级单证据中构造有限双证据动作；
+- 根据模型分数执行动作并更新 `K`；
+- 运行测试、生成补丁或判断补丁是否解决任务。
+
+因此，最终部署对象是一个被迭代调用的 Cross-Encoder Ranker；完整系统可以包含不可训练的检索与控制逻辑，但不会增加第二个训练模型。
 
 ## 20. 质量评估与最小试验
 
