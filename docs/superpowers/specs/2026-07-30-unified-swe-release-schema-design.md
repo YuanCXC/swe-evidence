@@ -252,9 +252,9 @@ unified_swe_dataset_v1/
 | `action_type` | string | `single`、`pair` 或 `stop` |
 | `evidence_ids` | list\<string> | 单证据长度为 1，双证据长度为 2，STOP 为空 |
 | `candidate_scope` | string | `online`、`offline_injected` 或 `stop`；只用于数据审计，不进入模型输入 |
-| `candidate_sources` | list\<string> | BM25、路径、符号、结构关系、witness、教师或困难负例等候选来源 |
-| `online_retrieval_rank` | int32 | 在线召回时的原始名次；离线注入动作和 STOP 为 null |
-| `online_retrieval_score` | float32 | 冻结融合规则得到的在线召回分数；离线注入动作和 STOP 为 null |
+| `candidate_sources` | list\<string> | 在线单证据的四通道来源，或 pair、witness、教师、困难负例等构造来源；在线四通道按冻结顺序保存 |
+| `online_retrieval_rank` | int32 | 在线单证据经过四通道 RRF 后的最终融合名次；pair、离线注入动作和 STOP 为 null |
+| `online_retrieval_score` | float32 | 在线单证据按冻结等权 RRF 公式得到的融合分数；pair、离线注入动作和 STOP 为 null |
 | `completion_gain` | float32 | 动作带来的 `C` 增量 |
 | `progress_gain` | float32 | 动作带来的 `P` 增量 |
 | `completion_interaction` | float32 | 双证据的完成度交互增益 `I_C`；单证据和 STOP 为 null |
@@ -812,7 +812,7 @@ python scripts/build_unified_dataset.py `
 - 教师模型、Prompt 版本、有效样本数、调用数量、技术重试率、规则拒绝率和人工抽检结果；
 - validation 教师包的有效数量、任务覆盖率、状态覆盖率、关系分布、unknown 数量和冲突数量；
 - train/dev 无证书任务的删除数量、原因分布和排序 ID 集合 SHA-256；
-- 在线候选生成器 revision、冻结融合规则、train 对齐 Evidence Unit 数量的 p95、由此计算的 `online_single_cap`、固定 pair 配额，以及各 split 的候选数和必要正例溢出分布；
+- 在线候选生成器 revision、四通道名称与冻结顺序、各通道 revision、`rrf_k=64`、`channel_depth=64`、`final_depth=64`、各通道命中覆盖率、train 对齐 Evidence Unit 数量的 p95、由此计算的 `online_single_cap`、固定 pair 配额，以及各 split 的候选数和必要正例溢出分布；
 - 默认累计证据 Token 预算和唯一 Evidence Unit 上限；
 - 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
 - 冻结 Tokenizer 的名称、revision、输入渲染版本，以及模型、问题和 Evidence Unit 的 Token 上限；
@@ -857,6 +857,8 @@ python scripts/build_unified_dataset.py `
 - Manifest 中的 `evidence_token_budget` 不是 32,768，或 `selected_evidence_unit_cap` 不是 64；
 - `online_single_cap` 不是仅根据 train 中具备可靠对齐证据的任务计算，或与 Manifest 记录值不一致；
 - 任一状态的 `candidate_scope=online` 单证据动作数超过 `online_single_cap`；
+- 在线召回通道集合或顺序不是 `bm25_content`、`path_name`、`symbol`、`structure`，RRF 常数不是 64，单通道深度不是 64，或融合保留深度不是 64；
+- 任一在线单证据动作缺少融合名次或融合分数，任一 pair、离线注入动作或 STOP 的这两个字段不为 null；
 - 任一状态存在超过 8 个常规 pair，或必要正 pair 超额但 `candidate_overflow=false`；
 - 任一状态有超过 8 个困难负例设置 `action_loss_mask=true`；
 - 任一 `candidate_scope=online` 动作包含已经位于当前状态 `K` 的 Evidence Unit；
@@ -894,7 +896,7 @@ python scripts/build_unified_dataset.py `
 - 评分采用完成度 `C(K)` 和进度 `P(K)` 两个原始分量，STOP 使用严格 mandatory 覆盖规则。
 - 动作空间包含单证据、双证据和 STOP；双证据关系支持互补、替代、冗余、独立、冲突和未知。
 - 标签不足时使用受约束教师模型，但完成度、进度、动作增益和 STOP 始终由程序计算。
-- 在线候选采用固定问题基础召回与状态结构增量扩展；每次更新 `K` 后重建动作并由同一个 Cross-Encoder 重新评分。
+- 在线候选采用固定问题基础召回与状态结构增量扩展；四通道使用等权 RRF 融合，每次更新 `K` 后重建动作并由同一个 Cross-Encoder 重新评分。
 - 在线正常终止由 STOP 竞争决定，并使用 32,768 累计证据 Token 与 64 个唯一 Evidence Unit 作为系统安全边界。
 
 ## 13. 冻结数据源与实测规模
@@ -1337,6 +1339,28 @@ online_candidates = retrieve(q, K, pre_fix_snapshot)
 - 按固定规则从高优先级单证据构造的有限 pair；
 - STOP。
 
+在线单证据召回固定为以下四个等权通道，通道名称和顺序均属于发布契约：
+
+```text
+retrieval_channels = [bm25_content, path_name, symbol, structure]
+channel_depth = 64
+rrf_k = 64
+final_depth = 64
+```
+
+每个可用通道先生成至多 64 个确定性排序结果，通道内名次从 1 开始。`bm25_content` 检索 Evidence Unit 正文，`path_name` 检索路径和文件名，`symbol` 检索符号定义与引用，`structure` 使用当前 `K` 在 pre-fix snapshot 内进行结构扩展。初始状态 `K=empty` 时 `structure` 自然为空；任务不存在可解析符号或结构边时，对应通道同样可以为空。空通道对所有候选贡献 0，禁止按实际可用通道数重新归一化。
+
+四个通道的结果先取并集，融合前最多包含 256 个唯一 Evidence Unit。对任意候选 `u`，固定使用 Reciprocal Rank Fusion：
+
+```text
+online_retrieval_score(u) =
+    sum(1 / (64 + rank_c(u)) for c in retrieval_channels if u in c)
+```
+
+融合后排序键依次为：`online_retrieval_score` 降序、`best_source_rank` 升序、`evidence_id` 升序，其中 `best_source_rank` 是 `u` 在所有命中通道中的最小通道内名次。只保留前 64 个单证据结果，最终位置从 1 开始写入 `online_retrieval_rank`。`candidate_sources` 只记录实际命中的通道，并始终按上述冻结通道顺序排列。各通道原始名次和派生的 `best_source_rank` 留在构建 SQLite 中供审计，不扩充正式发布 Schema；它们必须能由冻结检索器重放得到。
+
+RRF 只融合单证据结果。在线 pair 是完成融合和截断后按固定关系规则构造的动作，因此 pair 的 `online_retrieval_rank` 和 `online_retrieval_score` 必须为 null。融合分数是候选生成元数据，不能作为 Cross-Encoder 输入特征。不得训练第二个融合模型，也不得使用 validation、benchmark、Gold、教师标签或 witness 信息调节通道权重与 RRF 参数。
+
 在线执行采用“固定问题基础召回 + 状态结构增量扩展”，不把整个 `K` 的正文追加到 BM25 查询。对任意状态定义：
 
 ```text
@@ -1351,7 +1375,7 @@ eligible_single_candidates =
 每次 `K` 更新后，系统必须执行以下步骤：
 
 1. 合并仍有效的基础候选和结构扩展候选，删除已位于 `K` 中、不属于当前 snapshot 或重复的 Evidence Unit。
-2. 使用同一冻结融合规则重新计算在线来源、名次和分数，再按第 18.3 节的 `online_single_cap` 截断。
+2. 使用上述四通道等权 RRF 重新计算在线来源、名次和分数；四通道融合先保留 64 个结果，再按第 18.3 节的 `online_single_cap` 截断。当前冻结 `online_single_cap=64`，两道边界一致，但二者的来源和审计含义不同。
 3. 从截断后的新单证据集合重新构造在线 pair；pair 的两个成员都必须尚未位于 `K`。
 4. 固定加入 STOP，并用同一个 Cross-Encoder 对当前全部动作重新评分。上一轮未选中的候选不得永久标为负例，其边际价值必须按新状态重新判断。
 
@@ -1379,7 +1403,7 @@ training_candidates =
     union STOP
 ```
 
-在线已召回动作设置 `candidate_scope=online`。只因离线 Gold 或对照构造而加入的动作设置 `candidate_scope=offline_injected`。STOP 设置为 `candidate_scope=stop`。`candidate_scope`、`candidate_sources`、`online_retrieval_rank` 和 `online_retrieval_score` 只用于采样、审计与分轨评测，不能出现在 Cross-Encoder 的文本输入中。
+在线已召回单证据及由其构造的在线 pair 设置 `candidate_scope=online`。只因离线 Gold 或对照构造而加入的动作设置 `candidate_scope=offline_injected`。STOP 设置为 `candidate_scope=stop`。只有在线单证据填写 `online_retrieval_rank` 和 `online_retrieval_score`；在线 pair 通过 `candidate_sources` 记录其构造来源，这两个 RRF 字段仍为 null。`candidate_scope`、`candidate_sources`、`online_retrieval_rank` 和 `online_retrieval_score` 只用于采样、审计与分轨评测，不能出现在 Cross-Encoder 的文本输入中。
 
 离线注入保证召回器漏掉的高质量正例仍能参与 Ranker 训练，但不得伪装成在线召回成功。validation 和 benchmark 的 Oracle 候选轨道允许注入；端到端在线轨道必须删除所有 `offline_injected` 动作后重新执行候选构造与排序。
 
@@ -1400,7 +1424,7 @@ online_single_cap = min(128, next_power_of_two(aligned_unit_p95))
 
 每个状态按以下顺序构造候选池：
 
-1. 从 scoreable 在线召回结果中保留前 `online_single_cap` 个单证据动作；排序键固定为 `online_retrieval_score` 降序、原始召回名次升序、`evidence_id` 升序。
+1. 从 scoreable 在线召回结果中保留前 `online_single_cap` 个单证据动作；排序键固定为 `online_retrieval_score` 降序、构建时保存的 `best_source_rank` 升序、`evidence_id` 升序。
 2. 对每个未完成 mandatory obligation 选择 1 条确定性、跨来源或规则验证教师支持的有效 Witness 路径，并补入其中尚未位于 `K`、也未被在线候选覆盖的 Evidence Unit。存在多条路径时，按新增 Evidence Unit 正文 Token 总成本升序、group ID 升序确定唯一结果。
 3. 补入教师实际标注的 Evidence Unit，以及被在线上限遗漏的已知非支配正动作。
 4. 对 Evidence Unit 去重后生成 pair；常规 pair 配额固定为 8，优先级为 mandatory AND Witness、教师标注困难 pair、在线结构 pair、已确认困难负 pair。
