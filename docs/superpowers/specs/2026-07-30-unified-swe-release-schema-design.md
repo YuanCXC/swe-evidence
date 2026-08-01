@@ -253,6 +253,8 @@ unified_swe_dataset_v1/
 | `online_retrieval_rank` | int32 | 在线召回时的原始名次；离线注入动作和 STOP 为 null |
 | `completion_gain` | float32 | 动作带来的 `C` 增量 |
 | `progress_gain` | float32 | 动作带来的 `P` 增量 |
+| `completion_interaction` | float32 | 双证据的完成度交互增益 `I_C`；单证据和 STOP 为 null |
+| `progress_interaction` | float32 | 双证据的 witness 进度交互增益 `I_P`；单证据和 STOP 为 null |
 | `token_cost` | int32 | 加入状态的正文 Token 数 |
 | `relation` | string | `complement`、`substitute`、`redundant`、`independent`、`conflict` 或 `unknown` |
 | `covered_obligation_ids` | list\<string> | 动作完成或推进的义务 |
@@ -1340,6 +1342,48 @@ STOP 不参与证据动作之间的 Pareto 比较。严格 STOP 规则优先于�
 - `C(K)` 无法可靠计算：相关策略标签为 null，后续通过损失掩码排除。
 
 STOP 不增加语义证据，因此在可判定状态下固定为 `semantic_useful=false`，`pareto_dominated=null`。证据动作即使因成本被支配，也必须保留其真实 `semantic_useful`，不能被错误改写为语义负例。
+
+### 18.5 双证据交互增益
+
+双证据的总增益不能直接表示两条证据是否产生组合价值。每个 pair 动作必须显式记录相对于当前状态 `K` 的二阶交互量：
+
+```text
+I_C(u, v | K) =
+    completion_gain([u, v] | K)
+    - completion_gain([u] | K)
+    - completion_gain([v] | K)
+
+I_P(u, v | K) =
+    progress_gain([u, v] | K)
+    - progress_gain([u] | K)
+    - progress_gain([v] | K)
+```
+
+等价的反事实形式为：
+
+```text
+I_C(u, v | K) =
+    C(K union {u, v})
+    - C(K union {u})
+    - C(K union {v})
+    + C(K)
+```
+
+`I_P` 使用 `P` 按相同方式计算。数据集只保存 `completion_interaction=I_C` 和 `progress_interaction=I_P`，不复制保存 4 份反事实状态。
+
+交互值的主要解释为：
+
+| 取值 | 数值含义 | 关系证据 |
+|------|----------|----------|
+| `I > 0` | 组合增益大于单项增益之和 | 支持互补 |
+| `I` 约等于 0 | 贡献基本可加，或存在单侧无增益证据 | 可能独立或单侧冗余 |
+| `I < 0` | 两条证据存在价值重叠或边际收益递减 | 支持替代或冗余 |
+
+数值比较使用固定容差 `epsilon=1e-6`，但存储值不得提前离散化。同一个 `[u, v]` 在不同 `K` 下可以拥有不同交互值，因此交互量属于状态—动作标签，不能提升为全局 pair 属性。
+
+交互值不能机械替代关系标签：负值无法独立区分 substitute 与 redundant，零值无法独立区分 independent 与单侧 redundant，conflict 通常需要语义判断。最终关系仍由 witness graph、确定性结构规则、教师共识或人工标注确定。
+
+用于交互监督的 pair 必须在同一状态中同时保留 `[u]`、`[v]` 和 `[u, v]` 三个动作，并且 3 个动作的 `completion_gain` 与 `progress_gain` 均可计算。条件不满足时两个交互字段为 null，不能参与交互数值监督。
 
 ## 19. 唯一训练模型：Cross-Encoder Evidence Policy Ranker
 
