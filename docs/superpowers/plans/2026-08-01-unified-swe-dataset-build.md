@@ -27,10 +27,10 @@
 
 ## 任务 2：来源校验、规范化、身份与冻结切分
 
-- [ ] 先加入最小 Parquet/JSONL fixture 测试，覆盖 SWE-bench 唯一任务、ContextBench overlay 去重、SWE-Explore 精确 ID 对齐、Gold 不进入 `input`、固定 split 和无证书删除原因。
-- [ ] 运行自测并确认新增测试因加载函数缺失而失败。
-- [ ] 实现来源文件发现、固定来源元数据、缺失下载、SHA-256、SQLite 表初始化、任务合并和切分写入。
-- [ ] 在真实来源上运行 `--through-phase split --audit-only`，验证原始数量为 19,008/225/2,294，overlay 不新增任务。
+- [x] 先加入最小 Parquet/JSONL fixture 测试，覆盖 SWE-bench 唯一任务、ContextBench overlay 去重、SWE-Explore 精确 ID 对齐、Gold 不进入 `input` 和固定 split；无证书删除由任务 4 的真实监督映射测试覆盖。
+- [x] 运行自测并确认新增测试因加载函数缺失而失败。
+- [x] 实现来源文件发现、固定来源元数据、缺失下载、SHA-256、SQLite 表初始化、任务合并和切分写入。
+- [x] 在真实来源上运行 `--through-phase split --audit-only`，验证原始数量为 19,008/225/2,294，overlay 不新增任务。
 
 ## 任务 3：Git 快照、唯一文件版本与 Evidence Unit
 
