@@ -248,6 +248,9 @@ unified_swe_dataset_v1/
 | `action_id` | string | 规范化动作 ID |
 | `action_type` | string | `single`、`pair` 或 `stop` |
 | `evidence_ids` | list\<string> | 单证据长度为 1，双证据长度为 2，STOP 为空 |
+| `candidate_scope` | string | `online`、`offline_injected` 或 `stop`；只用于数据审计，不进入模型输入 |
+| `candidate_sources` | list\<string> | BM25、路径、符号、结构关系、witness、教师或困难负例等候选来源 |
+| `online_retrieval_rank` | int32 | 在线召回时的原始名次；离线注入动作和 STOP 为 null |
 | `completion_gain` | float32 | 动作带来的 `C` 增量 |
 | `progress_gain` | float32 | 动作带来的 `P` 增量 |
 | `token_cost` | int32 | 加入状态的正文 Token 数 |
@@ -444,6 +447,13 @@ unified_swe_dataset_v1/
 | 证据定位 | ContextBench、SWE-Explore、patch 派生位置 | Recall@K、MRR、nDCG |
 | 证据充分性 | ContextBench、SWE-Explore、人工审核样本 | obligation coverage、STOP accuracy |
 | 证据交互 | witness group 与人工审核样本 | pair relation F1、pair utility ranking |
+
+所有证据类评测必须分别报告两种候选模式：
+
+- `oracle_candidate_ranking`：向候选池注入缺失 Gold，只评估唯一 Cross-Encoder 对已给定候选的排序、组合与 STOP 能力；
+- `end_to_end_online`：候选只能由问题、当前证据和 pre-fix 仓库生成，不允许 Gold 注入，用于评估规则召回与 Cross-Encoder 组成的完整系统。
+
+两个模式必须分别报告样本数和指标，不得用 Oracle 候选结果代替端到端结果。
 
 ### 6.3 Gold 发布策略
 
@@ -1224,24 +1234,59 @@ patch、test patch 和 Gold 信号只能用于离线标注，不得复制到 `in
 
 不得通过随机加入任意文件制造“困难状态”。受控扰动必须保留状态来源和被删除、加入的 Evidence Unit。
 
-### 18.2 候选池
+### 18.2 在线候选与离线标签候选分离
 
-每个状态的候选池由以下来源并集组成：
+候选分离发生在 repository corpus 和 Evidence Unit 构建完成之后、状态与动作标签生成之前。它是候选可见性边界，不增加发布文件，也不引入第二个训练模型。
 
-- 尚未获取的 witness；
-- SWE-Explore core/optional 映射单元；
-- 与当前状态或 patch anchor 有调用、导入、继承、读写关系的单元；
-- Retriever 在同一 snapshot 中返回的高分单元；
-- 已验证的重叠、替代、独立和冲突对照；
+在线候选只允许使用真实运行时可见的信息：
+
+```text
+online_candidates = retrieve(q, K, pre_fix_snapshot)
+```
+
+在线候选可以来自：
+
+- BM25 等冻结词法检索；
+- 文件路径、文件名和问题关键词匹配；
+- 符号定义与引用匹配；
+- 从已召回单元扩展出的调用、导入、继承和读写关系；
+- 按固定规则从高优先级单证据构造的有限 pair；
 - STOP。
+
+在线候选生成禁止读取参考补丁、测试答案、ContextBench Gold、SWE-Explore core/optional、witness group、教师解释或人工标签。在线 pair 也不能依据 Gold witness 关系构造。
+
+离线标签候选用于确定训练真值和补足正例，可以使用：
+
+- SWE-bench patch 的 pre-fix 映射位置；
+- 严格对齐的 ContextBench 和 SWE-Explore 证据；
+- obligation witness group；
+- 规则验证后的教师共识或人工标注；
+- 已验证的替代、冗余、独立、冲突和困难负例。
+
+训练状态的物理候选集合为：
+
+```text
+training_candidates =
+    online_candidates
+    union missing_positive_injections
+    union controlled_hard_negatives
+    union STOP
+```
+
+在线已召回动作设置 `candidate_scope=online`。只因离线 Gold 或对照构造而加入的动作设置 `candidate_scope=offline_injected`。STOP 设置为 `candidate_scope=stop`。`candidate_scope`、`candidate_sources` 和 `online_retrieval_rank` 只用于采样、审计与分轨评测，不能出现在 Cross-Encoder 的文本输入中。
+
+离线注入保证召回器漏掉的高质量正例仍能参与 Ranker 训练，但不得伪装成在线召回成功。validation 和 benchmark 的 Oracle 候选轨道允许注入；端到端在线轨道必须删除所有 `offline_injected` 动作后重新执行候选构造与排序。
 
 所有候选必须属于当前 `snapshot_id`。未被 Gold 选中只表示未知，只有满足明确反证规则的单元才能标为 hard negative。
 
 ### 18.3 单证据与双证据动作
 
-每个状态先生成单证据动作，再从受控关系图生成有限的双证据动作。禁止对全部候选做 `O(n^2)` 枚举。
+每个状态先生成单证据动作，再生成有限的双证据动作。禁止对全部候选做 `O(n^2)` 枚举。在线 pair 和离线注入 pair 必须分别构造：
 
-双证据候选优先级：
+- 在线 pair：只从在线高优先级单证据以及调用、导入、继承、读写、同文件相邻等可见结构关系生成；
+- 离线注入 pair：允许依据 witness group、跨来源证据和已验证关系补入训练所需的正例与对照。
+
+离线双证据候选优先级：
 
 1. 同一 AND witness group。
 2. 同一义务的不同替代 group。
@@ -1249,7 +1294,7 @@ patch、test patch 和 Gold 信号只能用于离线标注，不得复制到 `in
 4. ContextBench/SWE-Explore 共现但关系尚未确认的 pair。
 5. 重叠、包含和内容重复的冗余对照。
 
-只有前 3 类在证据充分时可以产生强关系标签；第 4 类默认 `unknown`，除非教师共识或人工确认。
+只有前 3 类在证据充分时可以产生强关系标签；第 4 类默认 `unknown`，除非教师共识或人工确认。离线 Gold 产生的 pair 必须设置 `candidate_scope=offline_injected`，不能因为其成员曾被在线召回就把 Gold 配对关系伪装为在线构造结果。
 
 ### 18.4 语义有用性与策略可接受性
 
