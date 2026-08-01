@@ -425,8 +425,8 @@ unified_swe_dataset_v1/
 
 ### 5.3 切分要求
 
-- `train.parquet` 继承 SWE-bench train，共 19,008 个任务。
-- `validation.parquet` 继承 SWE-bench dev，共 225 个任务。
+- SWE-bench 原始 train 有 19,008 个任务；删除 672 个无法构造 pre-fix 证据证书的任务后，`train.parquet` 固定包含 18,336 个任务。
+- SWE-bench 原始 dev 有 225 个任务；删除 2 个无法构造 pre-fix 证据证书的任务后，`validation.parquet` 固定包含 223 个任务。
 - `benchmark.parquet` 继承 SWE-bench test，共 2,294 个任务。
 - ContextBench、SWE-Explore 和教师派生标签必须继承对应 SWE-bench 任务的 split，不得重新随机切分。
 - 同一 `task_group_id`、Issue、PR 或派生变体不得跨 split。
@@ -435,15 +435,19 @@ unified_swe_dataset_v1/
 
 当前冻结来源的强监督分布为：train 中 38 个 ContextBench Poly 对齐任务；benchmark 中 313 个 ContextBench Verified 对齐任务和 451 个 SWE-Explore Verified 对齐任务。由于大部分跨来源强标签位于 benchmark，教师标注的主要用途是补足 train 和 validation，而不是把 benchmark 数据迁移到 train。
 
+删除的 674 个任务均具备 SWE-bench 身份和 pre-fix snapshot，但不能形成可训练的 pre-fix 证据证书：train 中 469 个同时缺少 patch 与 test patch，139 个 patch 只新增文件，64 个虽有旧侧 patch 但无法映射出有效 anchor；dev 中 2 个 patch 只新增文件。这些任务如果保留，只能产生全 unknown 或全部 loss mask 为 false 的记录，不进入最终任务文件。
+
+删除集合按规范化 `task_id` 排序后计算 SHA-256。完整 ID 和逐项原因只保存到 SQLite；Manifest 记录 train/dev 删除数量、原因分布和 ID 集合哈希，不新增发布文件。该规则不改变上游 SWE-bench 的原始规模统计，也不删除 benchmark 任务。
+
 ### 5.4 教师标签直接验证
 
-validation 直接使用 1,800 个通过程序约束的唯一教师包，不再增加人工校准。固定覆盖全部 225 个 SWE-bench dev 任务，每个任务包含 2 个关键状态，每个状态包含 4 个困难 pair：
+validation 直接使用 1,784 个通过程序约束的唯一教师包，不再增加人工校准。固定覆盖最终 223 个 dev 任务，每个任务包含 2 个关键状态，每个状态包含 4 个困难 pair：
 
 ```text
-225 tasks × 2 states × 4 pairs = 1,800 teacher packets
+223 tasks × 2 states × 4 pairs = 1,784 teacher packets
 ```
 
-教师只判断义务、Witness Group 和义务级 pair 关系。程序仍根据教师语义图统一计算 `C`、`P`、动作增益、Pareto、STOP、聚合关系目标和损失掩码。只有满足第 17.5 节全部约束并记录为 `teacher_verified` 的标签才能进入 validation；语义冲突、非法引用和规则拒绝结果转为 `unknown` 或从损失中屏蔽，并从相同任务、状态和关系分层补入替代包，直到有效数量达到 1,800。
+教师只判断义务、Witness Group 和义务级 pair 关系。程序仍根据教师语义图统一计算 `C`、`P`、动作增益、Pareto、STOP、聚合关系目标和损失掩码。只有满足第 17.5 节全部约束并记录为 `teacher_verified` 的标签才能进入 validation；语义冲突、非法引用和规则拒绝结果转为 `unknown` 或从损失中屏蔽，并从相同任务、状态和关系分层补入替代包，直到有效数量达到 1,784。
 
 这些 `teacher_verified` 标签允许进入 validation loss，并据此执行早停和检查点选择。其局限是 validation loss 衡量的主要是学生模型与教师语义策略的一致性，可能继承教师的系统性偏置。为隔离该偏置，benchmark Gold 继续禁止使用 teacher-only 标签，最终研究结论必须以冻结 benchmark 的确定性、跨来源或人工真值为准。
 
@@ -806,6 +810,7 @@ python scripts/build_unified_dataset.py `
 - 义务类型、witness group 大小、关系类别和 STOP 标签分布；
 - 教师模型、Prompt 版本、有效样本数、调用数量、技术重试率、规则拒绝率和人工抽检结果；
 - validation 教师包的有效数量、任务覆盖率、状态覆盖率、关系分布、unknown 数量和冲突数量；
+- train/dev 无证书任务的删除数量、原因分布和排序 ID 集合 SHA-256；
 - train 对齐 Evidence Unit 数量的 p95、由此计算的 `online_single_cap`、固定 pair 配额，以及各 split 的候选数和必要正例溢出分布；
 - 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
 - 冻结 Tokenizer 的名称、revision、输入渲染版本，以及模型、问题和 Evidence Unit 的 Token 上限；
@@ -820,11 +825,12 @@ python scripts/build_unified_dataset.py `
 以下任一条件不满足时禁止发布：
 
 - 三个任务文件存在重复 `task_id`；
-- train、validation、benchmark 的任务数不分别等于 19,008、225 和 2,294；
+- train、validation、benchmark 的任务数不分别等于 18,336、223 和 2,294；
+- 删除集合不等于已冻结的 672 个 train 和 2 个 dev 任务，删除原因统计或排序 ID 集合 SHA-256 与 Manifest 不一致，或被删除任务仍进入任一最终任务文件；
 - `task_group_id` 跨 split；
 - 模型可见输入中包含 Gold；
 - validation 或 benchmark 存在轨迹；
-- validation 有效教师包数量不等于 1,800，或没有完整覆盖 225 个 dev 任务各 2 个状态、每状态 4 个困难 pair；
+- validation 有效教师包数量不等于 1,784，或没有完整覆盖 223 个 dev 任务各 2 个状态、每状态 4 个困难 pair；
 - 任一进入 validation loss 的教师标签未通过第 17.5 节程序验证；
 - benchmark 任务或派生任务进入 train；
 - 任一 mandatory obligation 没有可解析的 witness group；
@@ -905,6 +911,11 @@ python scripts/build_unified_dataset.py `
 | SWE-bench dev | 225 |
 | SWE-bench test | 2,294 |
 | SWE-bench 总任务 | 21,527 |
+| 删除的无证书 train/dev 任务 | 674 |
+| 最终发布 train | 18,336 |
+| 最终发布 validation | 223 |
+| 最终发布 benchmark | 2,294 |
+| 最终发布总任务 | 20,853 |
 | ContextBench 原始主任务 | 1,136 |
 | ContextBench 严格对齐任务 | 351 |
 | SWE-Explore 原始任务 | 848 |
@@ -1257,7 +1268,7 @@ API 超时、空响应、截断或 JSON 解析失败属于技术失败，可以�
 ### 17.6 Split 使用边界
 
 - train：允许规则验证后的单次教师标签。
-- validation：直接使用 1,800 个通过程序约束的 `teacher_verified` 包计算 validation loss，并用于早停和检查点选择；程序从教师语义图重算全部派生标签。
+- validation：直接使用 1,784 个通过程序约束的 `teacher_verified` 包计算 validation loss，并用于早停和检查点选择；程序从教师语义图重算全部派生标签。
 - benchmark：teacher-only 标签不能作为 Gold，只能用于辅助分析；benchmark Gold 必须来自确定性规则、跨来源一致或人工确认。
 
 ### 17.7 最终教师标注规模
@@ -1267,8 +1278,8 @@ API 超时、空响应、截断或 JSON 解析失败属于技术失败，可以�
 | 用途 | 唯一教师包 | 构造方式 |
 |------|-----------:|----------|
 | train 主标注 | 12,000 | 1,500 个分层抽样任务 × 2 个关键状态 × 4 个困难 pair |
-| validation 主标注 | 1,800 | 225 个 dev 任务 × 2 个关键状态 × 4 个困难 pair；通过程序约束后直接使用 |
-| train 稀有关系补充 | 1,200 | 定向补充 conflict、跨文件 complement 和难区分的 substitute/redundant |
+| validation 主标注 | 1,784 | 223 个 dev 任务 × 2 个关键状态 × 4 个困难 pair；通过程序约束后直接使用 |
+| train 稀有关系补充 | 1,216 | 定向补充 conflict、跨文件 complement 和难区分的 substitute/redundant，并接收 validation 释放的 16 个包 |
 | benchmark Gold | 0 | 禁止 teacher-only 标签成为 benchmark Gold |
 | 合计 | 15,000 | 不含 API 技术失败重试 |
 
@@ -1335,7 +1346,7 @@ training_candidates =
 
 ### 18.3 候选规模与配额
 
-候选上限只限制常规在线候选，不能删除完成 mandatory obligation 所需的证据。预构建审计显示：官方 SWE-bench train 的 19,008 个任务中，当前 18,336 个有可用证书；每任务对齐 Evidence Unit 数量的 p50、p90、p95、p99 和 max 分别为 5、25、42、122 和 2,351。官方 dev 的 225 个任务中当前 223 个有可用证书，对应数值为 10、37、54、105 和 140。当前缺失的 672 个 train 证书和 2 个 dev 证书说明旧产物不能发布；最终构建必须先满足第 11 节的完整 split 门槛。
+候选上限只限制常规在线候选，不能删除完成 mandatory obligation 所需的证据。预构建审计显示：最终保留的 18,336 个 train 任务中，每任务对齐 Evidence Unit 数量的 p50、p90、p95、p99 和 max 分别为 5、25、42、122 和 2,351；最终保留的 223 个 dev 任务对应数值为 10、37、54、105 和 140。第 5.3 节定义的 672 个 train 和 2 个 dev 无证书任务在计算这些分布之前删除。
 
 全局单证据在线上限只根据最终 train 中“至少有 1 条可靠对齐 Evidence Unit 且具备可计算监督”的任务计算，禁止读取 validation 或 benchmark 分布：
 
