@@ -230,6 +230,7 @@ unified_swe_dataset_v1/
 | 子字段 | 类型 | 含义 |
 |--------|------|------|
 | `state_id` | string | 任务内唯一状态 ID |
+| `state_type` | string | 决策角色：`initial`、`decision_boundary` 或 `complete` |
 | `step` | int32 | 状态序号；初始状态为 0 |
 | `evidence_ids` | list\<string> | 当前状态 `K` 已获得的 Evidence Unit |
 | `completed_obligation_ids` | list\<string> | 已完整满足的义务 |
@@ -1289,15 +1290,25 @@ API 超时、空响应、截断或 JSON 解析失败属于技术失败，可以�
 
 ### 18.1 状态来源
 
-最终数据集支持 3 类状态：
+每个任务自适应生成 2～3 个互不重复的 `policy_state`，最多生成 3 个。状态数量由可验证的证据结构决定，不通过复制状态或随机加入文件凑齐固定数量。
 
-| 状态类型 | 构造方式 | 可信度 |
-|----------|----------|--------|
-| `initial` | `K = empty` | 确定性 |
-| `gold_prefix` | 按 witness 或可靠轨迹前缀逐步加入证据 | strong/support |
-| `controlled_corruption` | 从充分证据集中删除一个 witness 或加入已验证冗余项 | support |
+| `state_type` | 构造方式 | 训练目的 |
+|--------------|----------|----------|
+| `initial` | 固定 `K = empty` | 从零开始选择第一批证据；此时 STOP 为负例 |
+| `decision_boundary` | 优先使用最接近充分但仍不充分的 Gold 状态；无法形成自然前缀时，才允许使用已验证的受控扰动 | 学习继续补证，避免提前 STOP |
+| `complete` | `K` 固定为规范化最小充分证书 | 学习证据充分后选择 STOP，并拒绝冗余动作 |
 
-不得通过随机加入任意文件制造“困难状态”。受控扰动必须保留状态来源和被删除、加入的 Evidence Unit。
+`initial` 和 `complete` 必须存在。`decision_boundary` 只有在能够构造出与二者不同、且 `C(K) < 1` 的状态时才存在。所有状态先将 `evidence_ids` 排序，再按其哈希去重；去重后不补齐缺失状态。
+
+自然临界状态从规范化最小充分证书 `W*` 构造。程序枚举删除其中一个 Evidence Unit 后的集合 `K = W* - {u}`，仅保留 `C(K) < 1` 的集合，按 `C(K)`、`P(K)` 从高到低选择最接近充分的一项；仍并列时依次选择 Token 成本较低、排序后 Evidence Unit ID 序列字典序较小的一项。该规则不依赖任意的证据排列顺序。
+
+当 `|W*| = 1` 时，删除唯一 witness 会退化为 `initial`，不能作为临界状态。此时仅允许用一个已经获得 `negative` 标签且 `action_loss_mask=true` 的困难负例替换该 witness，构成 `controlled_corruption`；优先选择在线召回排名最高的困难负例。没有满足条件的负例时，该任务只保留 `initial` 和 `complete`。
+
+`label_source` 必须记录状态的实际构造来源：`deterministic_initial`、`gold_prefix`、`controlled_corruption` 或 `reference_certificate`。受控扰动还必须记录被删除和加入的 Evidence Unit，不得使用 `unknown` 动作、随机文件或 benchmark 泄漏信息。
+
+按当前自动证书、尚未加入教师增强和受控扰动的实测结果，train 的 18,336 个证书大小均为 1，因此产生 36,672 个基础状态；validation 产生 666 个基础状态；benchmark 产生 6,863 个基础状态；合计 44,201 个。教师增强和受控扰动可能增加临界状态，但 20,853 个最终任务的状态总数不得超过 62,559，train 不得超过 55,008。
+
+第 17.7 节的“每个教师任务 2 个关键状态”不等于每个任务只能发布 2 个状态。教师优先标注 `initial + decision_boundary`；任务不存在 `decision_boundary` 时标注 `initial + complete`。未送入教师的状态仍可由 witness graph 和确定性规则生成动作增益、STOP、Pareto 和损失掩码，不增加教师包预算。
 
 ### 18.2 在线候选与离线标签候选分离
 
