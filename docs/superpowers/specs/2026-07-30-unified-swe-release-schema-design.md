@@ -257,6 +257,9 @@ unified_swe_dataset_v1/
 | `completion_interaction` | float32 | 双证据的完成度交互增益 `I_C`；单证据和 STOP 为 null |
 | `progress_interaction` | float32 | 双证据的 witness 进度交互增益 `I_P`；单证据和 STOP 为 null |
 | `token_cost` | int32 | 加入状态的正文 Token 数 |
+| `model_input_token_count` | int32 | 按冻结渲染规则得到的完整 `(q, K, A)` Token 数 |
+| `rendered_state_body_evidence_ids` | list\<string> | 本次评分中正文实际进入 `K` 模型视图的 Evidence Unit；`K` 中其余证据仍保留元数据 |
+| `scoreable` | bool | 完整模型输入是否满足长度与可见性约束 |
 | `relations` | list\<struct> | 当前状态下按 obligation 记录的双证据关系；单证据和 STOP 为空数组 |
 | `relation_targets` | struct | 多标签关系头的 complement、substitute、redundant、independent、conflict 目标值 |
 | `covered_obligation_ids` | list\<string> | 动作完成或推进的义务 |
@@ -357,6 +360,9 @@ unified_swe_dataset_v1/
 | `executable` | bool | 测试环境是否可执行 |
 | `snapshot_available` | bool | 是否具备完整仓库快照 |
 | `evidence_mapping_rate` | float32 | Gold 到 Evidence Unit 的映射率 |
+| `problem_token_count` | int32 | 完整 `problem_statement` 使用冻结 Tokenizer 编码后的 Token 数 |
+| `model_question_token_count` | int32 | 问题进入模型视图后的 Token 数，最大为 2,048 |
+| `question_truncated` | bool | 模型问题视图是否按冻结的首尾保留规则裁剪；原始正文不受影响 |
 | `warnings` | list\<string> | 非阻断质量提示 |
 
 高严重度身份冲突、悬空证据引用和快照缺失不得以 warning 形式进入发布。
@@ -596,6 +602,7 @@ unified_swe_dataset_v1/
 | `parent_evidence_id` | string | 父级 Evidence Unit；没有时为 null |
 | `content_sha256` | string | 对行号范围对应正文切片计算的哈希 |
 | `token_count` | int32 | 使用冻结 Tokenizer 计算的正文 Token 数 |
+| `rendered_token_count` | int32 | 加入路径、符号、行号和结构标记后的 Token 数 |
 | `scoreable` | bool | 是否允许作为 Cross-Encoder 候选动作 |
 
 行号采用 1-based、闭区间语义。Evidence Unit 的正文通过以下规则恢复：
@@ -606,7 +613,7 @@ unit_content = file_content_lines[start_line - 1:end_line]
 
 每个可搜索文本文件必须生成且只生成一个 `unit_type=file` 的 Evidence Unit，范围为 `1..line_count`。解析成功时继续生成 class、function、method 和 doc_section。无法解析的可搜索文本文件按固定窗口降级生成 `code_block`，不得因为解析失败丢弃完整文件。
 
-文件级 Evidence Unit 用于成员关系、文件级召回和审计。如果正文超过 Cross-Encoder 上限，则必须设置 `scoreable=false`，不能直接成为动作。过大的类、函数或 ContextBench/SWE-Explore 区域继续按语法边界或固定窗口切分，直到形成有界单元。双证据动作的两段正文加上问题和状态摘要后仍必须满足模型最大长度；无法满足时拆分动作或放弃该 pair，不允许静默截断关键证据。
+文件级 Evidence Unit 用于成员关系、文件级召回和审计，固定设置 `scoreable=false`。可评分单元必须满足 `rendered_token_count <= 1024`。超过上限的 class、function、ContextBench/SWE-Explore 区域和 line window 必须继续按方法、语法块或固定窗口切分；不能通过扩大模型输入接纳整类、生成文件或超长常量表。双证据动作的两段正文加上问题和状态表示后仍必须满足模型最大长度；无法满足时继续切分动作单元或设置动作 `scoreable=false`，不允许静默截断候选证据。
 
 所有监督标签统一引用 `evidence_id`：文件级标签指向 `unit_type=file`，细粒度标签指向对应的类、函数、方法、代码块或文档章节。`file_version_id` 只用于标识 corpus 的物理文件版本行，不作为监督标签 ID。
 
@@ -784,8 +791,10 @@ python scripts/build_unified_dataset.py `
 - strong、support、weak 的数量；
 - 独立任务数、状态数、单证据动作数、双证据动作数和候选数；
 - 义务类型、witness group 大小、关系类别和 STOP 标签分布；
-- 教师模型、Prompt 版本、调用数量、一致率、规则拒绝率和人工抽检结果；
+- 教师模型、Prompt 版本、有效样本数、调用数量、技术重试率、规则拒绝率和人工抽检结果；
 - 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
+- 冻结 Tokenizer 的名称、revision、输入渲染版本，以及模型、问题和 Evidence Unit 的 Token 上限；
+- 问题、Evidence Unit 和完整模型输入的 mean、p50、p90、p95、p99、max、裁剪率及不可评分率；
 - 去重和身份冲突统计；
 - split 防泄漏审计；
 - 文件和 Evidence Unit 引用完整率；
@@ -814,6 +823,11 @@ python scripts/build_unified_dataset.py `
 - Git tree 中的 `path + blob_oid` 与 corpus 成员关系不一致；
 - `blob_oid`、文件正文和 `content_sha256` 校验不一致；
 - `evidence_id` 引用完整率低于 100%；
+- 构建时使用的 Tokenizer 名称或 revision 与冻结值不一致；
+- 任一 `scoreable=true` Evidence Unit 的 `rendered_token_count` 大于 1,024；
+- 任一 `scoreable=true` 动作的 `model_input_token_count` 大于 4,096；
+- 候选 Evidence Unit 正文被截断，或问题裁剪未被 `quality.question_truncated` 记录；
+- `rendered_state_body_evidence_ids` 包含不属于当前状态 `K` 的证据，或实际渲染结果与该字段不一致；
 - manifest 记录的任一数据文件哈希与实际文件不一致；
 - 高严重度身份冲突进入任一任务文件；
 - benchmark 的 split 或 membership 未冻结；
@@ -1548,6 +1562,54 @@ f_theta(q, empty, A)
 
 双证据动作 `[u, v]` 作为一个整体动作输入模型。训练时可以随机交换 `u` 与 `v` 的渲染顺序，但其规范化 `action_id` 不变，防止模型学习固定位置偏差。
 
+#### 19.3.1 真实长度审计
+
+输入上限由冻结数据的实际分布确定，不使用经验猜测。审计使用 `BAAI/bge-reranker-v2-m3` 的 Tokenizer，冻结 revision 为 `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`，按加入特殊 Token 后的最终模型输入计数。该 Tokenizer 声明的最大长度是 8,192，但本项目训练和推理统一使用 4,096，控制显存、吞吐量和候选评分成本。
+
+对 21,527 个严格 SWE-bench 任务的完整 `problem_statement` 实测如下：
+
+| 指标 | Token 数或比例 |
+|------|----------------|
+| mean / p50 / p75 | 630.89 / 335 / 711 |
+| p90 / p95 / p99 | 1,313 / 1,902 / 4,296 |
+| max | 119,272 |
+| `> 1,024` / `> 1,536` | 14.76% / 7.54% |
+| `> 2,048` / `> 4,096` | 4.26% / 1.11% |
+
+对当前抽取结果中的 295,377 个 Evidence Unit，按“路径、符号、行号、正文”完整渲染后实测如下：
+
+| 指标 | 全部单元 | function | line_window | class |
+|------|----------|----------|-------------|-------|
+| 数量 | 295,377 | 143,029 | 103,314 | 47,632 |
+| mean | 755.52 | 396 | 721 | 1,910 |
+| p50 | 446 | 212 | 574 | 1,314 |
+| p90 | 1,710 | 870 | 1,193 | 4,306 |
+| p95 | 3,298 | 1,302 | 1,573 | 4,956 |
+| `> 2,048` | 8.39% | 2.11% | 2.57% | 40.03% |
+| `> 4,096` | 2.47% | — | — | 12.65% |
+
+当前抽取结果中的超长尾部包含明确异常：例如 6,524 行的 spaCy Tokenizer exception 窗口，以及 2,000～3,000 行的生成式 Google Cloud Proto/Client 文件。它们说明抽取器必须继续切分或过滤，而不是说明模型需要接纳整个类、生成文件或常量表。
+
+按当前证书与 witness 数据重建真实输入后，初始单证据动作共 18,435 个，mean / p50 / p90 / p95 分别为 1,112 / 727 / 2,220 / 3,182 Token，超过 4,096 的比例为 2.94%；初始双证据动作共 2,923 个，对应数值为 1,216 / 965 / 2,172 / 2,829，超过 4,096 的比例为 1.81%。未经切分的原始双单元 witness 有 23.96% 超过 4,096，主要由上述超长 class 和异常窗口造成，因此不能直接作为可评分动作。
+
+#### 19.3.2 冻结长度约束
+
+最终约束固定为：
+
+```text
+model_max_length        = 4096
+question_max_tokens     = 2048
+scoreable_unit_max_tokens = 1024
+```
+
+4,096 是完整 `(q, K, A)` 输入的硬上限，不是对三部分预先平均分配的静态预算。渲染器先保留候选动作 `A` 的完整正文和当前状态 `K` 的全部证据元数据，再把剩余预算动态分配给 `K` 的正文。`K` 正文按最近获得优先、稳定 ID 打破并列的顺序加入；实际进入模型的正文 ID 写入 `rendered_state_body_evidence_ids`。如果全部元数据和完整 `A` 已经超过 4,096，则该动作设置 `scoreable=false`。
+
+`problem_statement` 原文始终完整保存在 `input.problem_statement`。当问题编码不超过 2,048 Token 时原样进入模型；超过时，模型视图保留前 1,536 Token、固定标记 `[TRUNCATED_MIDDLE]`，再用剩余预算保留尾部，保证特殊 Token 和标记计入后问题视图不超过 2,048。完整长度、模型视图长度和裁剪状态分别写入 `quality.problem_token_count`、`quality.model_question_token_count` 和 `quality.question_truncated`。
+
+候选动作 `A` 不允许裁掉正文。单个候选 Evidence Unit 的完整渲染长度不得超过 1,024；超长 class、function、代码区域和窗口必须先按方法、语法块或固定窗口继续拆分。双证据动作必须同时完整包含两段 Evidence Unit。若完整 `(q, K, A)` 超过 4,096，应继续拆分证据单元；仍无法满足时保留该动作供数据审计，但设置 `scoreable=false`、`action_loss_mask=false`，不得送入模型训练、阈值选择或主要指标。
+
+训练和推理使用同一渲染函数、Tokenizer revision 和特殊标记。DataLoader 必须令 Tokenizer 的自动截断失效，并先断言 `model_input_token_count <= 4096`；任何依赖 `truncation=true` 静默修剪候选正文的实现都属于发布阻断错误。
+
 ### 19.4 统一输出与动作选择
 
 动作排序头对每个候选动作输出一个标量：
@@ -1622,6 +1684,14 @@ unique_repo_count
 ```
 
 禁止把状态数、pair 数或候选数表述为独立 SWE 任务数量。
+
+同时必须按 train、validation、benchmark 和全量分别报告以下输入长度统计：
+
+- 完整问题、模型问题视图、各类 Evidence Unit 和完整 `(q, K, A)` 的 mean、p50、p90、p95、p99、max；
+- `quality.question_truncated=true` 的任务数与比例；
+- `scoreable=false` 的 Evidence Unit、单证据动作、双证据动作和 STOP 数量及比例；
+- 因超长而被继续拆分的 class、function、代码区域和 line window 数量；
+- 每个状态中 `K` 的证据总数、正文实际可见数，以及两者差值的分布。
 
 ### 20.2 固定审计样本
 
