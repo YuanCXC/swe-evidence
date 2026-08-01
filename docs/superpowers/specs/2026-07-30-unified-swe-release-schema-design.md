@@ -256,7 +256,8 @@ unified_swe_dataset_v1/
 | `completion_interaction` | float32 | 双证据的完成度交互增益 `I_C`；单证据和 STOP 为 null |
 | `progress_interaction` | float32 | 双证据的 witness 进度交互增益 `I_P`；单证据和 STOP 为 null |
 | `token_cost` | int32 | 加入状态的正文 Token 数 |
-| `relation` | string | `complement`、`substitute`、`redundant`、`independent`、`conflict` 或 `unknown` |
+| `relations` | list\<struct> | 当前状态下按 obligation 记录的双证据关系；单证据和 STOP 为空数组 |
+| `relation_targets` | struct | 多标签关系头的 complement、substitute、redundant、independent、conflict 目标值 |
 | `covered_obligation_ids` | list\<string> | 动作完成或推进的义务 |
 | `semantic_useful` | bool | 动作是否对 `C` 或 `P` 产生正语义增益；标签未知时为 null |
 | `policy_acceptable` | bool | 动作是否属于当前状态下值得执行的非支配动作集合；标签未知时为 null |
@@ -264,10 +265,10 @@ unified_swe_dataset_v1/
 | `dominated_by_action_ids` | list\<string> | 严格支配当前动作的同状态动作 ID；不可判定时为空列表 |
 | `label_source` | string | 规则、跨来源、轨迹、教师共识或人工 |
 | `confidence` | float32 | 动作标签置信度 |
-| `relation_loss_mask` | bool | 是否参与关系分类损失 |
+| `relation_loss_mask` | bool | 是否至少存在一个可参与多标签关系损失的已知目标 |
 | `annotation_ids` | list\<string> | 对应的标注来源 ID |
 
-单证据和 STOP 动作的 `relation` 为 null，且 `relation_loss_mask=false`。双证据动作的 `evidence_ids` 必须排序，保证 `[u, v]` 与 `[v, u]` 只有一个物理动作。训练时可以随机交换两段正文的输入顺序，避免模型学习位置偏差。
+`relations` 中每项包含 `obligation_id`、`relation`、`confidence`、`label_source` 和 `annotation_ids`。单证据和 STOP 动作的 `relations=[]`、`relation_targets=null` 且 `relation_loss_mask=false`。双证据动作的 `evidence_ids` 必须排序，保证 `[u, v]` 与 `[v, u]` 只有一个物理动作。训练时可以随机交换两段正文的输入顺序，避免模型学习位置偏差。
 
 允许的 `training_targets`：
 
@@ -448,7 +449,7 @@ unified_swe_dataset_v1/
 | 代码修复 | SWE-bench test | `patch_resolved`、测试通过率 |
 | 证据定位 | ContextBench、SWE-Explore、patch 派生位置 | Recall@K、MRR、nDCG |
 | 证据充分性 | ContextBench、SWE-Explore、人工审核样本 | obligation coverage、STOP accuracy |
-| 证据交互 | witness group 与人工审核样本 | pair relation F1、pair utility ranking |
+| 证据交互 | witness group 与人工审核样本 | multi-label pair relation F1、pair utility ranking |
 
 所有证据类评测必须分别报告两种候选模式：
 
@@ -1184,7 +1185,8 @@ patch、test patch 和 Gold 信号只能用于离线标注，不得复制到 `in
 - 从固定 7 种义务类型中选择；
 - 引用输入中真实存在的 `evidence_id`；
 - 使用 AND group 和 group 间 OR；
-- 从固定关系枚举中选择；
+- 针对明确的 `obligation_id` 从固定关系枚举中选择；
+- 为同一个 pair 输出多条不同 obligation 的关系记录；
 - 输出 `unknown`；
 - 给出结构化置信度和简短依据。
 
@@ -1192,6 +1194,7 @@ patch、test patch 和 Gold 信号只能用于离线标注，不得复制到 `in
 
 - 创建新的代码正文或不存在的 Evidence Unit；
 - 直接给出最终 `C`、`P`、动作增益或 STOP；
+- 直接聚合 `relation_targets`；该多标签目标必须由程序根据义务级记录和置信度生成；
 - 把未提供的仓库文件加入 witness；
 - 覆盖确定性冲突标签。
 
@@ -1385,6 +1388,52 @@ I_C(u, v | K) =
 
 用于交互监督的 pair 必须在同一状态中同时保留 `[u]`、`[v]` 和 `[u, v]` 三个动作，并且 3 个动作的 `completion_gain` 与 `progress_gain` 均可计算。条件不满足时两个交互字段为 null，不能参与交互数值监督。
 
+### 18.6 状态与义务条件化的多标签关系
+
+双证据关系不是全局 pair 属性。同一个 `[u, v]` 可以针对不同 obligation 同时具有不同关系，也可以随当前状态 `K` 改变。关系监督必须保存在具体 `policy_state.candidate_actions` 内，并按 obligation 展开：
+
+```json
+{
+  "relations": [
+    {
+      "obligation_id": "obl_state_flow",
+      "relation": "complement",
+      "confidence": 1.0,
+      "label_source": "witness_graph",
+      "annotation_ids": []
+    },
+    {
+      "obligation_id": "obl_validation",
+      "relation": "substitute",
+      "confidence": 0.9,
+      "label_source": "teacher_consensus",
+      "annotation_ids": ["ann_123"]
+    }
+  ],
+  "relation_targets": {
+    "complement": 1.0,
+    "substitute": 0.9,
+    "redundant": null,
+    "independent": null,
+    "conflict": null
+  }
+}
+```
+
+`relation_targets` 是固定字段的多标签目标，不设置 `primary_relation`。每个已确认类别的目标值取该类别义务级记录中的最大置信度；被可靠排除的类别为 `0.0`；证据不足、未判断或仅有 `unknown` 记录的类别为 null。null 不等于负例，训练时必须屏蔽。
+
+关系辅助头对 5 个类别分别使用 Sigmoid，而不是在互斥类别上使用 Softmax。同一个 pair 可以同时预测 complement 和 substitute，因为两者可能对应不同 obligation。`unknown` 不作为模型需要预测的第 6 个类别，只表示对应关系监督不可用。
+
+义务级关系只描述当前状态下 pair 对该义务的作用：
+
+- 同一 AND witness group 中缺一不可的证据支持 complement；
+- 同一义务不同 OR witness group 中可独立满足义务的证据支持 substitute；
+- 相同内容、包含关系或已被 `K` 覆盖的边际贡献支持 redundant；
+- 分别推进不同义务且无显著交互的证据支持 independent；
+- 对同一义务给出不可同时成立的事实或约束时支持 conflict。
+
+结构关系和交互值只能提供候选标签或一致性检查，不能替代 obligation 语义。例如，`I<0` 可以支持 substitute 或 redundant，但不能单独区分二者。
+
 ## 19. 唯一训练模型：Cross-Encoder Evidence Policy Ranker
 
 ### 19.1 模型定义
@@ -1461,7 +1510,7 @@ A_star = argmax_A score(q, K, A)
 
 若 `A_star` 为单证据或双证据，系统将对应 Evidence Unit 加入 `K`，然后再次调用同一个模型；若 `A_star = STOP`，证据获取结束。STOP 不是另一个二分类模型，而是与证据动作竞争的特殊动作。
 
-对于双证据动作，关系辅助头同时输出 complement、substitute、redundant、independent、conflict 或 unknown 的关系分布。该分布用于辅助损失和关系评测，不替代主排序分数，也不单独决定动作。单证据和 STOP 不计算关系损失。
+对于双证据动作，关系辅助头通过 5 个独立 Sigmoid 输出 complement、substitute、redundant、independent 和 conflict 的多标签概率。多个类别可以同时为真；unknown 通过目标值 null 和损失掩码表达，不作为第 6 个输出类别。关系输出用于辅助损失和评测，不替代主排序分数，也不单独决定动作。单证据和 STOP 不计算关系损失。
 
 ### 19.5 训练方式
 
@@ -1477,7 +1526,7 @@ A_star = argmax_A score(q, K, A)
 L_total = L_rank + lambda_relation * L_relation
 ```
 
-`L_relation` 只在拥有高置信度关系标签的双证据动作上计算；其余动作通过 `relation_loss_mask=false` 屏蔽。`lambda_relation` 由 validation split 选择，不能使用 benchmark 调参。
+`L_relation` 使用带掩码的多标签 Binary Cross-Entropy，只在拥有可靠义务级关系标签的双证据动作及非 null 类别上计算；其余动作通过 `relation_loss_mask=false` 屏蔽。`lambda_relation` 由 validation split 选择，不能使用 benchmark 调参。
 
 第一版训练按同一个模型检查点逐步加入更难样本，不在各阶段分别训练不同模型：
 
@@ -1490,7 +1539,7 @@ L_total = L_rank + lambda_relation * L_relation
 
 ### 19.6 模型与外围系统的边界
 
-模型只输出候选动作分数和可选的 pair relation 分布。以下工作属于外围系统，不属于模型本身：
+模型只输出候选动作分数和 pair relation 多标签概率。以下工作属于外围系统，不属于模型本身：
 
 - 从仓库语料中生成初始候选；
 - 根据路径、符号、导入和调用关系扩展候选；
