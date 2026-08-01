@@ -180,12 +180,10 @@ unified_swe_dataset_v1/
 | 子字段 | 类型 | 含义 |
 |--------|------|------|
 | `annotation_id` | string | 任务内唯一标注 ID |
-| `source` | string | `deterministic`、`cross_source`、`teacher_consensus` 或 `human` |
+| `source` | string | `deterministic`、`cross_source`、`teacher_verified` 或 `human` |
 | `source_record_ids` | list\<string> | 参与该判断的原始记录 ID |
 | `teacher_model` | string | 教师模型及 revision；非教师标签为 null |
 | `prompt_version` | string | Prompt 版本；非教师标签为 null |
-| `vote_count` | int32 | 一致票数；非投票标签为 null |
-| `agreement` | float32 | 一致率；非投票标签为 null |
 | `rule_verified` | bool | 是否通过确定性约束校验 |
 | `input_sha256` | string | 标注输入包的稳定哈希 |
 
@@ -210,7 +208,7 @@ unified_swe_dataset_v1/
 | `applicable` | bool | 该义务是否适用于当前任务 |
 | `mandatory` | bool | 是否为严格 STOP 的必要条件 |
 | `confidence` | float32 | 义务定义置信度 |
-| `construction_method` | string | 规则、跨来源一致、教师共识或人工审核 |
+| `construction_method` | string | 规则、跨来源一致、单次教师标注并经规则验证，或人工审核 |
 | `witness_groups` | list\<struct> | 可以满足该义务的一个或多个证据组 |
 | `annotation_ids` | list\<string> | 对应的标注来源 ID |
 
@@ -263,7 +261,7 @@ unified_swe_dataset_v1/
 | `policy_acceptable` | bool | 动作是否属于当前状态下值得执行的非支配动作集合；标签未知时为 null |
 | `pareto_dominated` | bool | 证据动作是否被同状态中的其他证据动作 Pareto 支配；STOP 为 null |
 | `dominated_by_action_ids` | list\<string> | 严格支配当前动作的同状态动作 ID；不可判定时为空列表 |
-| `label_source` | string | 规则、跨来源、轨迹、教师共识或人工 |
+| `label_source` | string | 规则、跨来源、轨迹、规则验证教师标签或人工 |
 | `confidence` | float32 | 动作标签置信度 |
 | `relation_loss_mask` | bool | 是否至少存在一个可参与多标签关系损失的已知目标 |
 | `annotation_ids` | list\<string> | 对应的标注来源 ID |
@@ -277,7 +275,7 @@ unified_swe_dataset_v1/
 
 `evidence_action_ranking` 同时覆盖单证据、双证据和 STOP 的统一排序。`interaction_classification` 只表示同一模型关系辅助头的标签可用性。候选召回不是训练目标，STOP 也不作为独立模型或独立训练目标。
 
-补丁生成、测试生成和失败轨迹建模不属于本数据集第一版的训练目标。
+补丁生成、测试生成和失败轨迹建模不属于本数据集的训练目标。
 
 ### 3.5 `trajectories`
 
@@ -391,7 +389,7 @@ unified_swe_dataset_v1/
 - ContextBench 仅为能够严格对齐的 SWE-bench 任务补充 Gold evidence，不新增任务。
 - SWE-Explore 仅为能够严格对齐的 SWE-bench 任务补充共识区域、可选区域和读取顺序，不新增任务。
 - 无法与 SWE-bench 对齐的 ContextBench、SWE-Explore 或其他来源记录不下载、不合并、不发布。
-- 第一版不接入 SWE-rebench、SWE-Gym、SWE-smith、Nebius 或其他扩展任务集。
+- 本数据集不接入 SWE-rebench、SWE-Gym、SWE-smith、Nebius 或其他扩展任务集。
 - SWE-bench train 中缺少强语义标签的任务，可以通过受约束教师标注补足训练监督。
 
 ## 5. `validation.parquet`
@@ -611,14 +609,14 @@ unit_content = file_content_lines[start_line - 1:end_line]
 
 ### 8.5 `imports`
 
-`imports` 保存第一版检索扩展所需的静态依赖：
+`imports` 保存检索扩展所需的静态依赖：
 
 | 子字段 | 类型 | 含义 |
 |--------|------|------|
 | `module` | string | 源文件声明的模块或包 |
 | `declared_at_line` | int32 | import 声明所在行 |
 
-`imports` 只保存由文件内容决定的声明，不保存 `resolved_path`。同一文件版本在不同 snapshot 中可能解析到不同目标，具体路径必须在加载任务快照时，根据该 snapshot 的文件成员关系确定。第一版不发布完整调用图、继承图或模型生成的关系边。
+`imports` 只保存由文件内容决定的声明，不保存 `resolved_path`。同一文件版本在不同 snapshot 中可能解析到不同目标，具体路径必须在加载任务快照时，根据该 snapshot 的文件成员关系确定。本数据集不发布完整调用图、继承图或模型生成的关系边。
 
 ### 8.6 `extraction`
 
@@ -647,7 +645,7 @@ data/raw/
 data/cache/repos/
 ```
 
-第一版只允许在 `scripts/` 下新增或保留一个最终构建入口 `build_unified_dataset.py`。不得为 adapter、标签阶段或发布阶段新增其他 Python 文件，也不使用外部配置文件。来源 revision、字段映射、质量门槛和 Prompt 版本全部作为版本化常量集中在该脚本内。教师 API 地址、密钥和模型名通过环境变量传入，密钥不得写入脚本、SQLite、manifest 或发布文件。
+最终实现只允许在 `scripts/` 下新增或保留一个构建入口 `build_unified_dataset.py`。不得为 adapter、标签阶段或发布阶段新增其他 Python 文件，也不使用外部配置文件。来源 revision、字段映射、质量门槛和 Prompt 版本全部作为版本化常量集中在该脚本内。教师 API 地址、密钥和模型名通过环境变量传入，密钥不得写入脚本、SQLite、manifest 或发布文件。
 
 缺少已启用的 SWE-bench、ContextBench 或 SWE-Explore 原始文件时，脚本从固定官方地址下载并校验 revision 与哈希。无法与 SWE-bench 对齐的来源记录不进入后续下载和仓库快照准备。
 
@@ -846,7 +844,7 @@ python scripts/build_unified_dataset.py `
 
 ### 13.1 数据源范围
 
-第一版只使用以下来源：
+最终数据集只使用以下来源：
 
 | 来源 | 角色 | 是否创建新任务 | 对齐要求 |
 |------|------|----------------|----------|
@@ -928,7 +926,7 @@ obligation
 
 1. 义务适用于当前问题。
 2. 至少存在一个能够解析到 repository corpus 的 witness group。
-3. 定义来自确定性规则、跨来源一致、教师共识且通过规则验证，或人工审核。
+3. 定义来自确定性规则、跨来源一致、单次教师标注且通过规则验证，或人工审核。
 4. 义务对理解故障或验证预期行为不可省略。
 
 ### 14.3 完成度
@@ -1069,7 +1067,7 @@ ContextBench 决定“哪些区域是高质量证据候选”，不单独决定�
 
 ### 16.1 字段语义
 
-SWE-Explore 官方定义中，`read_core` 是所有成功修复轨迹共同读取的区域，`optional` 是部分模型读取的诊断上下文。第一版使用方式如下：
+SWE-Explore 官方定义中，`read_core` 是所有成功修复轨迹共同读取的区域，`optional` 是部分模型读取的诊断上下文。最终使用方式如下：
 
 | 字段 | 用途 | 禁止解释 |
 |------|------|----------|
@@ -1198,16 +1196,11 @@ patch、test patch 和 Gold 信号只能用于离线标注，不得复制到 `in
 - 把未提供的仓库文件加入 witness；
 - 覆盖确定性冲突标签。
 
-### 17.5 一致性与验证
+### 17.5 单次标注与程序验证
 
-每个难例进行 3 次独立判断：
+每个教师包只进行 1 次语义标注，不做多次采样或多数投票。通过全部程序约束的结果记录为 `teacher_verified`；未通过约束的语义标签不得进入训练监督。
 
-| 一致性 | 标签来源 | 处理 |
-|--------|----------|------|
-| 3/3 | `teacher_consensus_strong` | 通过规则验证后可进入 train |
-| 2/3 | `teacher_consensus` | 通过规则验证后降低权重进入 train |
-| 低于 2/3 | `unknown` | 不参与对应监督损失 |
-| 与确定性标签冲突 | `conflict` | 不覆盖规则，进入人工抽检 |
+API 超时、空响应、截断或 JSON 解析失败属于技术失败，可以对同一输入包重试，但不构成新样本，也不用于语义投票。若教师判断与确定性标签冲突，确定性标签优先；教师结果记录为 `conflict` 并进入人工抽检，不再调用另一个教师进行仲裁。
 
 程序验证至少包括：
 
@@ -1221,15 +1214,29 @@ patch、test patch 和 Gold 信号只能用于离线标注，不得复制到 `in
 
 ### 17.6 Split 使用边界
 
-- train：允许规则验证后的教师共识标签。
+- train：允许规则验证后的单次教师标签。
 - validation：教师标签必须与确定性信号一致，或经过固定种子人工校准；teacher-only 状态不用于选择主要阈值。
 - benchmark：teacher-only 标签不进入主要指标，只能用于辅助分析；主要真值必须来自确定性规则、跨来源一致或人工确认。
+
+### 17.7 最终教师标注规模
+
+最终构建固定生成 15,000 个通过程序验证的唯一教师包，每个包对应一个 `(task_id, state_id, pair_action_id, obligation_set)`，并只进行 1 次有效语义标注：
+
+| 用途 | 唯一教师包 | 构造方式 |
+|------|-----------:|----------|
+| train 主标注 | 12,000 | 1,500 个分层抽样任务 × 2 个关键状态 × 4 个困难 pair |
+| validation 辅助标注 | 1,800 | 225 个 dev 任务 × 2 个关键状态 × 4 个困难 pair |
+| train 稀有关系补充 | 1,200 | 定向补充 conflict、跨文件 complement 和难区分的 substitute/redundant |
+| benchmark 主要真值 | 0 | 禁止 teacher-only 标签进入主要 benchmark 指标 |
+| 合计 | 15,000 | 不含 API 技术失败重试 |
+
+15,000 表示最终被接受的唯一标注样本数，不是 API 请求上限。若某个包无法通过引用、快照或 JSON 校验，必须从相同 repository、obligation 类型和关系缺口分层中补入替代包，直到有效样本数达到 15,000。教师包可以输出同一 pair 针对多个 obligation 的关系记录，因此最终义务级关系记录数可以高于 15,000。
 
 ## 18. 状态与候选动作构造
 
 ### 18.1 状态来源
 
-第一版支持 3 类状态：
+最终数据集支持 3 类状态：
 
 | 状态类型 | 构造方式 | 可信度 |
 |----------|----------|--------|
@@ -1265,7 +1272,7 @@ online_candidates = retrieve(q, K, pre_fix_snapshot)
 - SWE-bench patch 的 pre-fix 映射位置；
 - 严格对齐的 ContextBench 和 SWE-Explore 证据；
 - obligation witness group；
-- 规则验证后的教师共识或人工标注；
+- 规则验证后的单次教师标注或人工标注；
 - 已验证的替代、冗余、独立、冲突和困难负例。
 
 训练状态的物理候选集合为：
@@ -1299,7 +1306,7 @@ training_candidates =
 4. ContextBench/SWE-Explore 共现但关系尚未确认的 pair。
 5. 重叠、包含和内容重复的冗余对照。
 
-只有前 3 类在证据充分时可以产生强关系标签；第 4 类默认 `unknown`，除非教师共识或人工确认。离线 Gold 产生的 pair 必须设置 `candidate_scope=offline_injected`，不能因为其成员曾被在线召回就把 Gold 配对关系伪装为在线构造结果。
+只有前 3 类在证据充分时可以产生强关系标签；第 4 类默认 `unknown`，除非规则验证教师标签或人工确认。离线 Gold 产生的 pair 必须设置 `candidate_scope=offline_injected`，不能因为其成员曾被在线召回就把 Gold 配对关系伪装为在线构造结果。
 
 ### 18.4 语义有用性与策略可接受性
 
@@ -1384,7 +1391,7 @@ I_C(u, v | K) =
 
 数值比较使用固定容差 `epsilon=1e-6`，但存储值不得提前离散化。同一个 `[u, v]` 在不同 `K` 下可以拥有不同交互值，因此交互量属于状态—动作标签，不能提升为全局 pair 属性。
 
-交互值不能机械替代关系标签：负值无法独立区分 substitute 与 redundant，零值无法独立区分 independent 与单侧 redundant，conflict 通常需要语义判断。最终关系仍由 witness graph、确定性结构规则、教师共识或人工标注确定。
+交互值不能机械替代关系标签：负值无法独立区分 substitute 与 redundant，零值无法独立区分 independent 与单侧 redundant，conflict 通常需要语义判断。最终关系仍由 witness graph、确定性结构规则、规则验证教师标签或人工标注确定。
 
 用于交互监督的 pair 必须在同一状态中同时保留 `[u]`、`[v]` 和 `[u, v]` 三个动作，并且 3 个动作的 `completion_gain` 与 `progress_gain` 均可计算。条件不满足时两个交互字段为 null，不能参与交互数值监督。
 
@@ -1406,7 +1413,7 @@ I_C(u, v | K) =
       "obligation_id": "obl_validation",
       "relation": "substitute",
       "confidence": 0.9,
-      "label_source": "teacher_consensus",
+      "label_source": "teacher_verified",
       "annotation_ids": ["ann_123"]
     }
   ],
@@ -1528,7 +1535,7 @@ L_total = L_rank + lambda_relation * L_relation
 
 `L_relation` 使用带掩码的多标签 Binary Cross-Entropy，只在拥有可靠义务级关系标签的双证据动作及非 null 类别上计算；其余动作通过 `relation_loss_mask=false` 屏蔽。`lambda_relation` 由 validation split 选择，不能使用 benchmark 调参。
 
-第一版训练按同一个模型检查点逐步加入更难样本，不在各阶段分别训练不同模型：
+训练按同一个模型检查点逐步加入更难样本，不在各阶段分别训练不同模型：
 
 ```text
 单证据初始状态预热
@@ -1549,7 +1556,7 @@ L_total = L_rank + lambda_relation * L_relation
 
 因此，最终部署对象是一个被迭代调用的 Cross-Encoder Ranker；完整系统可以包含不可训练的检索与控制逻辑，但不会增加第二个训练模型。
 
-## 20. 质量评估与最小试验
+## 20. 完整构建质量评估
 
 ### 20.1 标签统计
 
@@ -1569,7 +1576,7 @@ unique_repo_count
 
 ### 20.2 固定审计样本
 
-正式扩展教师标签前，先构造 320 个反事实证据包：
+从最终 15,000 个教师包中固定抽取 320 个反事实审计包：
 
 ```text
 20 个任务 × 4 个候选 pair × 4 个证据包
@@ -1584,13 +1591,13 @@ K + v
 K + u + v
 ```
 
-试验至少覆盖互补、替代、冗余和独立关系，并检查：
+审计子集至少覆盖互补、替代、冗余和独立关系，并检查：
 
 - `completion_gain` 和 `progress_gain` 是否符合 witness graph；
 - 互补 pair 是否存在单独不完成、组合后完成的案例；
 - 替代证据在一个 group 已满足后，另一个 group 的边际价值是否下降；
 - 重复证据是否被错误赋予增益；
-- 教师一致率和规则拒绝率是否可接受；
+- 教师规则通过率、技术重试率和人工抽检准确率是否可接受；
 - 人工复核是否能依据原始证据重现标签。
 
 如果试验无法观察到稳定的正交互、替代衰减或严格 STOP，不能扩展 pair 数据，也不能把证据交互作为主要实验结论。
@@ -1600,7 +1607,7 @@ K + u + v
 固定随机种子抽检：
 
 - 100 个确定性或跨来源强监督任务；
-- 100 个教师共识训练任务；
+- 100 个规则验证教师训练任务；
 - 100 个跨文件 pair；
 - 100 个 `unknown`、冲突或规则拒绝任务。
 
