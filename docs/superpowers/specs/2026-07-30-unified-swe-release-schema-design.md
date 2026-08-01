@@ -236,6 +236,7 @@ unified_swe_dataset_v1/
 | `completion_score` | float32 | 当前强制义务完成度 `C(K)` |
 | `progress_score` | float32 | 当前 witness 进度 `P(K)` |
 | `candidate_actions` | list\<struct> | 单证据、双证据和 STOP 动作 |
+| `candidate_pool_stats` | struct | 当前状态的候选配额、实际数量和必要正例溢出信息 |
 | `stop_label` | string | `positive`、`negative` 或 `unknown` |
 | `stop_loss_mask` | bool | STOP 标签是否可参与训练或 validation loss |
 | `ranking_loss_mask` | bool | 当前状态是否具备可计算 listwise loss 的已知正、负动作 |
@@ -252,6 +253,7 @@ unified_swe_dataset_v1/
 | `candidate_scope` | string | `online`、`offline_injected` 或 `stop`；只用于数据审计，不进入模型输入 |
 | `candidate_sources` | list\<string> | BM25、路径、符号、结构关系、witness、教师或困难负例等候选来源 |
 | `online_retrieval_rank` | int32 | 在线召回时的原始名次；离线注入动作和 STOP 为 null |
+| `online_retrieval_score` | float32 | 冻结融合规则得到的在线召回分数；离线注入动作和 STOP 为 null |
 | `completion_gain` | float32 | 动作带来的 `C` 增量 |
 | `progress_gain` | float32 | 动作带来的 `P` 增量 |
 | `completion_interaction` | float32 | 双证据的完成度交互增益 `I_C`；单证据和 STOP 为 null |
@@ -275,6 +277,8 @@ unified_swe_dataset_v1/
 | `annotation_ids` | list\<string> | 对应的标注来源 ID |
 
 `relations` 中每项包含 `obligation_id`、`relation`、`confidence`、`label_source` 和 `annotation_ids`。`relation_loss_masks` 固定包含 complement、substitute、redundant、independent 和 conflict 5 个 bool 字段。单证据和 STOP 动作的 `relations=[]`、`relation_targets=null`，且 5 个关系 mask 均为 false。双证据动作的 `evidence_ids` 必须排序，保证 `[u, v]` 与 `[v, u]` 只有一个物理动作。训练时可以随机交换两段正文的输入顺序，避免模型学习位置偏差。
+
+`candidate_pool_stats` 固定包含 `online_single_cap`、`online_single_count`、`injected_required_single_count`、`regular_pair_cap`、`pair_count`、`loss_hard_negative_count`、`candidate_overflow` 和 `overflow_reasons`。数量字段使用 int32，`candidate_overflow` 使用 bool，`overflow_reasons` 使用 `list<string>`。
 
 允许的 `training_targets`：
 
@@ -802,6 +806,7 @@ python scripts/build_unified_dataset.py `
 - 义务类型、witness group 大小、关系类别和 STOP 标签分布；
 - 教师模型、Prompt 版本、有效样本数、调用数量、技术重试率、规则拒绝率和人工抽检结果；
 - validation 教师包的有效数量、任务覆盖率、状态覆盖率、关系分布、unknown 数量和冲突数量；
+- train 对齐 Evidence Unit 数量的 p95、由此计算的 `online_single_cap`、固定 pair 配额，以及各 split 的候选数和必要正例溢出分布；
 - 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
 - 冻结 Tokenizer 的名称、revision、输入渲染版本，以及模型、问题和 Evidence Unit 的 Token 上限；
 - 问题、Evidence Unit 和完整模型输入的 mean、p50、p90、p95、p99、max、裁剪率及不可评分率；
@@ -815,6 +820,7 @@ python scripts/build_unified_dataset.py `
 以下任一条件不满足时禁止发布：
 
 - 三个任务文件存在重复 `task_id`；
+- train、validation、benchmark 的任务数不分别等于 19,008、225 和 2,294；
 - `task_group_id` 跨 split；
 - 模型可见输入中包含 Gold；
 - validation 或 benchmark 存在轨迹；
@@ -838,6 +844,11 @@ python scripts/build_unified_dataset.py `
 - 构建时使用的 Tokenizer 名称或 revision 与冻结值不一致；
 - 任一 `scoreable=true` Evidence Unit 的 `rendered_token_count` 大于 1,024；
 - 任一 `scoreable=true` 动作的 `model_input_token_count` 大于 4,096；
+- `online_single_cap` 不是仅根据 train 中具备可靠对齐证据的任务计算，或与 Manifest 记录值不一致；
+- 任一状态的 `candidate_scope=online` 单证据动作数超过 `online_single_cap`；
+- 任一状态存在超过 8 个常规 pair，或必要正 pair 超额但 `candidate_overflow=false`；
+- 任一状态有超过 8 个困难负例设置 `action_loss_mask=true`；
+- 任一未完成 mandatory obligation 的选定 Witness 路径中，既不在当前状态 `K`、也没有作为单证据动作进入候选池的成员；
 - 候选 Evidence Unit 正文被截断，或问题裁剪未被 `quality.question_truncated` 记录；
 - `rendered_state_body_evidence_ids` 包含不属于当前状态 `K` 的证据，或实际渲染结果与该字段不一致；
 - manifest 记录的任一数据文件哈希与实际文件不一致；
@@ -1316,13 +1327,46 @@ training_candidates =
     union STOP
 ```
 
-在线已召回动作设置 `candidate_scope=online`。只因离线 Gold 或对照构造而加入的动作设置 `candidate_scope=offline_injected`。STOP 设置为 `candidate_scope=stop`。`candidate_scope`、`candidate_sources` 和 `online_retrieval_rank` 只用于采样、审计与分轨评测，不能出现在 Cross-Encoder 的文本输入中。
+在线已召回动作设置 `candidate_scope=online`。只因离线 Gold 或对照构造而加入的动作设置 `candidate_scope=offline_injected`。STOP 设置为 `candidate_scope=stop`。`candidate_scope`、`candidate_sources`、`online_retrieval_rank` 和 `online_retrieval_score` 只用于采样、审计与分轨评测，不能出现在 Cross-Encoder 的文本输入中。
 
 离线注入保证召回器漏掉的高质量正例仍能参与 Ranker 训练，但不得伪装成在线召回成功。validation 和 benchmark 的 Oracle 候选轨道允许注入；端到端在线轨道必须删除所有 `offline_injected` 动作后重新执行候选构造与排序。
 
 所有候选必须属于当前 `snapshot_id`。未被 Gold 选中只表示未知，只有满足明确反证规则的单元才能标为 hard negative。
 
-### 18.3 单证据与双证据动作
+### 18.3 候选规模与配额
+
+候选上限只限制常规在线候选，不能删除完成 mandatory obligation 所需的证据。预构建审计显示：官方 SWE-bench train 的 19,008 个任务中，当前 18,336 个有可用证书；每任务对齐 Evidence Unit 数量的 p50、p90、p95、p99 和 max 分别为 5、25、42、122 和 2,351。官方 dev 的 225 个任务中当前 223 个有可用证书，对应数值为 10、37、54、105 和 140。当前缺失的 672 个 train 证书和 2 个 dev 证书说明旧产物不能发布；最终构建必须先满足第 11 节的完整 split 门槛。
+
+全局单证据在线上限只根据最终 train 中“至少有 1 条可靠对齐 Evidence Unit 且具备可计算监督”的任务计算，禁止读取 validation 或 benchmark 分布：
+
+```text
+aligned_unit_p95 = nearest_rank_p95(train_task_aligned_evidence_unit_count)
+online_single_cap = min(128, next_power_of_two(aligned_unit_p95))
+```
+
+`nearest_rank_p95` 固定取升序数组第 `ceil(0.95 × n)` 个值，避免不同统计库的插值差异。当前实测 `aligned_unit_p95=42`，因此结果为 `online_single_cap=64`。正式构建必须根据最终 train 标签重新执行同一公式，并把输入任务数、p95 和结果写入 Manifest；train、validation 和 benchmark 随后共用该冻结值。
+
+每个状态按以下顺序构造候选池：
+
+1. 从 scoreable 在线召回结果中保留前 `online_single_cap` 个单证据动作；排序键固定为 `online_retrieval_score` 降序、原始召回名次升序、`evidence_id` 升序。
+2. 对每个未完成 mandatory obligation 选择 1 条确定性、跨来源或规则验证教师支持的有效 Witness 路径，并补入其中尚未位于 `K`、也未被在线候选覆盖的 Evidence Unit。存在多条路径时，按新增 Evidence Unit 正文 Token 总成本升序、group ID 升序确定唯一结果。
+3. 补入教师实际标注的 Evidence Unit，以及被在线上限遗漏的已知非支配正动作。
+4. 对 Evidence Unit 去重后生成 pair；常规 pair 配额固定为 8，优先级为 mandatory AND Witness、教师标注困难 pair、在线结构 pair、已确认困难负 pair。
+5. 固定加入 1 个 STOP。
+
+第 2～3 步补入的单证据动作设置 `candidate_scope=offline_injected`。必要正例优先于数量上限：若补入后单证据总数超过 `online_single_cap`，或必要正 pair 使 pair 总数超过 8，必须保留正例并设置 `candidate_pool_stats.candidate_overflow=true`，同时在 `overflow_reasons` 中记录 `required_single` 或 `required_pair`。非必要候选不得借 overflow 绕过配额。
+
+困难负例不创建额外的大候选池。优先从已保留的在线单证据和 pair 中选择；不足时才允许从已验证的冗余、冲突或受控反事实中补入。每个状态最多有 8 个困难负例设置 `action_loss_mask=true`；其余已知负例可以保留真实 `action_label=negative`，但不进入该状态的主排序损失。unknown 候选可以保留以还原在线竞争，必须设置 `action_loss_mask=false`。
+
+普通状态的目标规模为：
+
+```text
+最多 64 个在线单证据 + 最多 8 个常规 pair + 1 个 STOP
+```
+
+64 是当前审计结果，不是永久硬编码；永久规则是 train-only p95 的二次幂上取整并封顶 128。Manifest 必须分别报告各 split 的 single、pair、STOP、loss-active hard negative、unknown、overflow 状态数和候选总数的 mean、p50、p90、p95、p99、max。
+
+### 18.4 单证据与双证据动作
 
 每个状态先生成单证据动作，再生成有限的双证据动作。禁止对全部候选做 `O(n^2)` 枚举。在线 pair 和离线注入 pair 必须分别构造：
 
@@ -1339,7 +1383,7 @@ training_candidates =
 
 只有前 3 类在证据充分时可以产生强关系标签；第 4 类默认 `unknown`，除非规则验证教师标签或人工确认。离线 Gold 产生的 pair 必须设置 `candidate_scope=offline_injected`，不能因为其成员曾被在线召回就把 Gold 配对关系伪装为在线构造结果。
 
-### 18.4 语义有用性与策略可接受性
+### 18.5 语义有用性与策略可接受性
 
 动作标签必须区分“提供信息”和“当前值得执行”。`semantic_useful` 只描述动作相对于当前状态 `K` 是否产生语义增益：
 
@@ -1384,7 +1428,7 @@ STOP 不参与证据动作之间的 Pareto 比较。严格 STOP 规则优先于�
 
 STOP 不增加语义证据，因此在可判定状态下固定为 `semantic_useful=false`，`pareto_dominated=null`。证据动作即使因成本被支配，也必须保留其真实 `semantic_useful`，不能被错误改写为语义负例。
 
-### 18.5 双证据交互增益
+### 18.6 双证据交互增益
 
 双证据的总增益不能直接表示两条证据是否产生组合价值。每个 pair 动作必须显式记录相对于当前状态 `K` 的二阶交互量：
 
@@ -1426,7 +1470,7 @@ I_C(u, v | K) =
 
 用于交互监督的 pair 必须在同一状态中同时保留 `[u]`、`[v]` 和 `[u, v]` 三个动作，并且 3 个动作的 `completion_gain` 与 `progress_gain` 均可计算。条件不满足时两个交互字段为 null，不能参与交互数值监督。
 
-### 18.6 状态与义务条件化的多标签关系
+### 18.7 状态与义务条件化的多标签关系
 
 双证据关系不是全局 pair 属性。同一个 `[u, v]` 可以针对不同 obligation 同时具有不同关系，也可以随当前状态 `K` 改变。关系监督必须保存在具体 `policy_state.candidate_actions` 内，并按 obligation 展开：
 
@@ -1472,7 +1516,7 @@ I_C(u, v | K) =
 
 结构关系和交互值只能提供候选标签或一致性检查，不能替代 obligation 语义。例如，`I<0` 可以支持 substitute 或 redundant，但不能单独区分二者。
 
-### 18.7 显式标签与损失掩码
+### 18.8 显式标签与损失掩码
 
 缺少标签不等于负例。所有训练目标必须显式区分 `positive`、`negative` 和 `unknown`，并由独立 loss mask 决定是否进入损失。教师只提供上游 obligation、witness 和义务级关系；本节全部标签与 mask 均由程序生成，不增加教师调用。
 
