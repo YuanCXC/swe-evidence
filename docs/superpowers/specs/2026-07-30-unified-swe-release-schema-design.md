@@ -236,6 +236,9 @@ unified_swe_dataset_v1/
 | `completion_score` | float32 | 当前强制义务完成度 `C(K)` |
 | `progress_score` | float32 | 当前 witness 进度 `P(K)` |
 | `candidate_actions` | list\<struct> | 单证据、双证据和 STOP 动作 |
+| `stop_label` | string | `positive`、`negative` 或 `unknown` |
+| `stop_loss_mask` | bool | STOP 标签是否可参与训练与主要指标 |
+| `ranking_loss_mask` | bool | 当前状态是否具备可计算 listwise loss 的已知正、负动作 |
 | `label_source` | string | 状态及动作标签的构造来源 |
 | `confidence` | float32 | 状态级标签置信度 |
 
@@ -259,14 +262,16 @@ unified_swe_dataset_v1/
 | `covered_obligation_ids` | list\<string> | 动作完成或推进的义务 |
 | `semantic_useful` | bool | 动作是否对 `C` 或 `P` 产生正语义增益；标签未知时为 null |
 | `policy_acceptable` | bool | 动作是否属于当前状态下值得执行的非支配动作集合；标签未知时为 null |
+| `action_label` | string | 主排序标签：`positive`、`negative` 或 `unknown` |
+| `action_loss_mask` | bool | 当前动作是否参与主排序损失 |
 | `pareto_dominated` | bool | 证据动作是否被同状态中的其他证据动作 Pareto 支配；STOP 为 null |
 | `dominated_by_action_ids` | list\<string> | 严格支配当前动作的同状态动作 ID；不可判定时为空列表 |
 | `label_source` | string | 规则、跨来源、轨迹、规则验证教师标签或人工 |
 | `confidence` | float32 | 动作标签置信度 |
-| `relation_loss_mask` | bool | 是否至少存在一个可参与多标签关系损失的已知目标 |
+| `relation_loss_masks` | struct | 5 个关系类别各自是否参与多标签关系损失 |
 | `annotation_ids` | list\<string> | 对应的标注来源 ID |
 
-`relations` 中每项包含 `obligation_id`、`relation`、`confidence`、`label_source` 和 `annotation_ids`。单证据和 STOP 动作的 `relations=[]`、`relation_targets=null` 且 `relation_loss_mask=false`。双证据动作的 `evidence_ids` 必须排序，保证 `[u, v]` 与 `[v, u]` 只有一个物理动作。训练时可以随机交换两段正文的输入顺序，避免模型学习位置偏差。
+`relations` 中每项包含 `obligation_id`、`relation`、`confidence`、`label_source` 和 `annotation_ids`。`relation_loss_masks` 固定包含 complement、substitute、redundant、independent 和 conflict 5 个 bool 字段。单证据和 STOP 动作的 `relations=[]`、`relation_targets=null`，且 5 个关系 mask 均为 false。双证据动作的 `evidence_ids` 必须排序，保证 `[u, v]` 与 `[v, u]` 只有一个物理动作。训练时可以随机交换两段正文的输入顺序，避免模型学习位置偏差。
 
 允许的 `training_targets`：
 
@@ -1441,6 +1446,50 @@ I_C(u, v | K) =
 
 结构关系和交互值只能提供候选标签或一致性检查，不能替代 obligation 语义。例如，`I<0` 可以支持 substitute 或 redundant，但不能单独区分二者。
 
+### 18.7 显式标签与损失掩码
+
+缺少标签不等于负例。所有训练目标必须显式区分 `positive`、`negative` 和 `unknown`，并由独立 loss mask 决定是否进入损失。教师只提供上游 obligation、witness 和义务级关系；本节全部标签与 mask 均由程序生成，不增加教师调用。
+
+非 STOP 证据动作按以下规则生成主排序标签：
+
+```text
+policy_acceptable = true
+-> action_label = positive
+-> action_loss_mask = true
+
+policy_acceptable = false 且存在可靠反证
+-> action_label = negative
+-> action_loss_mask = true
+
+policy_acceptable = null 或仅仅未被 Gold 选中
+-> action_label = unknown
+-> action_loss_mask = false
+```
+
+可靠负例必须至少满足一项：已确认没有完成或进度增益、被其他动作 Pareto 支配、已验证冗余或冲突、属于受控困难负例，或证据已经充分后仍继续获取证据。unknown 动作保留在候选池和在线推理中，只从对应训练损失中排除。
+
+状态级 STOP 标签完全由 mandatory obligation 覆盖情况生成：
+
+```text
+C(K) = 1    -> stop_label = positive -> stop_loss_mask = true
+C(K) < 1    -> stop_label = negative -> stop_loss_mask = true
+C(K) = null -> stop_label = unknown  -> stop_loss_mask = false
+```
+
+STOP 动作的 `action_label` 必须与状态级 `stop_label` 一致，`action_loss_mask` 必须等于 `stop_loss_mask`。当 STOP 为 positive 时，同状态中继续获取证据的已知动作均为 negative；当 STOP 为 unknown 时，不能把它作为提前停止负例。
+
+一个状态只有在至少包含 1 个 `action_label=positive` 且至少包含 1 个 `action_label=negative` 的已知动作时，才能设置 `ranking_loss_mask=true`。计算 listwise loss 时，先按 `action_loss_mask` 删除 unknown 动作；`ranking_loss_mask=false` 的状态不参与主排序损失。
+
+多标签关系按类别独立生成目标和 mask：
+
+```text
+关系已确认成立  -> target > 0, mask = true
+关系已可靠排除  -> target = 0, mask = true
+关系尚未判断    -> target = null, mask = false
+```
+
+null 永远不能在加载时转换成 `0.0`。只有对应 `relation_loss_masks.<class>=true` 的类别才能进入 Binary Cross-Entropy。`relation_targets` 与 `relation_loss_masks` 必须逐类满足：target 为 null 当且仅当 mask 为 false。
+
 ## 19. 唯一训练模型：Cross-Encoder Evidence Policy Ranker
 
 ### 19.1 模型定义
@@ -1527,13 +1576,13 @@ A_star = argmax_A score(q, K, A)
 (q, K, {A_1, A_2, ..., A_n})
 ```
 
-主目标是在同一状态内提高有增量价值动作的分数，降低无关、冗余、冲突动作和过早 STOP 的分数；证据充分时则提高 STOP 的分数。一个状态允许存在多个正确动作，因此主损失采用支持多正例的 listwise ranking loss。关系分类作为辅助损失，与排序任务共享同一个 Backbone：
+主目标是在同一状态内提高有增量价值动作的分数，降低无关、冗余、冲突动作和过早 STOP 的分数；证据充分时则提高 STOP 的分数。一个状态允许存在多个正确动作，因此主损失采用支持多正例的 listwise ranking loss。主损失只读取 `ranking_loss_mask=true` 的状态和其中 `action_loss_mask=true` 的动作。关系分类作为辅助损失，与排序任务共享同一个 Backbone：
 
 ```text
 L_total = L_rank + lambda_relation * L_relation
 ```
 
-`L_relation` 使用带掩码的多标签 Binary Cross-Entropy，只在拥有可靠义务级关系标签的双证据动作及非 null 类别上计算；其余动作通过 `relation_loss_mask=false` 屏蔽。`lambda_relation` 由 validation split 选择，不能使用 benchmark 调参。
+`L_relation` 使用带掩码的多标签 Binary Cross-Entropy，只在拥有可靠义务级关系标签的双证据动作及 `relation_loss_masks.<class>=true` 的类别上计算。`lambda_relation` 由 validation split 选择，不能使用 benchmark 调参。
 
 训练按同一个模型检查点逐步加入更难样本，不在各阶段分别训练不同模型：
 
