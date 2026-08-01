@@ -812,7 +812,7 @@ python scripts/build_unified_dataset.py `
 - 教师模型、Prompt 版本、有效样本数、调用数量、技术重试率、规则拒绝率和人工抽检结果；
 - validation 教师包的有效数量、任务覆盖率、状态覆盖率、关系分布、unknown 数量和冲突数量；
 - train/dev 无证书任务的删除数量、原因分布和排序 ID 集合 SHA-256；
-- train 对齐 Evidence Unit 数量的 p95、由此计算的 `online_single_cap`、固定 pair 配额，以及各 split 的候选数和必要正例溢出分布；
+- 在线候选生成器 revision、冻结融合规则、train 对齐 Evidence Unit 数量的 p95、由此计算的 `online_single_cap`、固定 pair 配额，以及各 split 的候选数和必要正例溢出分布；
 - 唯一文件版本数、snapshot-file 成员关系数和正文去重率；
 - 冻结 Tokenizer 的名称、revision、输入渲染版本，以及模型、问题和 Evidence Unit 的 Token 上限；
 - 问题、Evidence Unit 和完整模型输入的 mean、p50、p90、p95、p99、max、裁剪率及不可评分率；
@@ -855,6 +855,8 @@ python scripts/build_unified_dataset.py `
 - 任一状态的 `candidate_scope=online` 单证据动作数超过 `online_single_cap`；
 - 任一状态存在超过 8 个常规 pair，或必要正 pair 超额但 `candidate_overflow=false`；
 - 任一状态有超过 8 个困难负例设置 `action_loss_mask=true`；
+- 任一 `candidate_scope=online` 动作包含已经位于当前状态 `K` 的 Evidence Unit；
+- 使用冻结在线候选生成器重放 `(q, K, snapshot_id)` 后，候选 ID、来源、名次或融合分数与发布记录不一致；
 - 任一未完成 mandatory obligation 的选定 Witness 路径中，既不在当前状态 `K`、也没有作为单证据动作进入候选池的成员；
 - 候选 Evidence Unit 正文被截断，或问题裁剪未被 `quality.question_truncated` 记录；
 - `rendered_state_body_evidence_ids` 包含不属于当前状态 `K` 的证据，或实际渲染结果与该字段不一致；
@@ -888,6 +890,7 @@ python scripts/build_unified_dataset.py `
 - 评分采用完成度 `C(K)` 和进度 `P(K)` 两个原始分量，STOP 使用严格 mandatory 覆盖规则。
 - 动作空间包含单证据、双证据和 STOP；双证据关系支持互补、替代、冗余、独立、冲突和未知。
 - 标签不足时使用受约束教师模型，但完成度、进度、动作增益和 STOP 始终由程序计算。
+- 在线候选采用固定问题基础召回与状态结构增量扩展；每次更新 `K` 后重建动作并由同一个 Cross-Encoder 重新评分。
 
 ## 13. 冻结数据源与实测规模
 
@@ -1328,6 +1331,28 @@ online_candidates = retrieve(q, K, pre_fix_snapshot)
 - 从已召回单元扩展出的调用、导入、继承和读写关系；
 - 按固定规则从高优先级单证据构造的有限 pair；
 - STOP。
+
+在线执行采用“固定问题基础召回 + 状态结构增量扩展”，不把整个 `K` 的正文追加到 BM25 查询。对任意状态定义：
+
+```text
+base_candidates = retrieve_by_question(q, pre_fix_snapshot)
+expanded_candidates = structural_expand(K, pre_fix_snapshot)
+eligible_single_candidates =
+    deduplicate(base_candidates union expanded_candidates) - K
+```
+
+`base_candidates` 在任务开始时按原始问题 `q` 计算，并在后续步骤保持同一排序锚点。`structural_expand(K)` 只使用 `K` 中 Evidence Unit 的调用、被调用、import、符号定义与引用、继承、读写、同文件相邻、路径和文件名关系。实现可以缓存已有扩展结果，每次只处理新加入 `K` 的 Evidence Unit；缓存后的并集必须与从完整 `K` 重放上述函数完全一致。
+
+每次 `K` 更新后，系统必须执行以下步骤：
+
+1. 合并仍有效的基础候选和结构扩展候选，删除已位于 `K` 中、不属于当前 snapshot 或重复的 Evidence Unit。
+2. 使用同一冻结融合规则重新计算在线来源、名次和分数，再按第 18.3 节的 `online_single_cap` 截断。
+3. 从截断后的新单证据集合重新构造在线 pair；pair 的两个成员都必须尚未位于 `K`。
+4. 固定加入 STOP，并用同一个 Cross-Encoder 对当前全部动作重新评分。上一轮未选中的候选不得永久标为负例，其边际价值必须按新状态重新判断。
+
+若 pair 的两个成员均已位于 `K`，则删除该动作；若只有一个成员已位于 `K`，则规范化为另一个新成员的单证据动作，不能保留为 pair。选择单证据 `[u]` 后执行 `K := K union {u}`；选择双证据 `[u, v]` 后同时加入二者；选择 STOP 后结束。增量扩展为空时继续使用剩余基础候选；没有任何可用证据动作时，候选池只保留 STOP。
+
+离线构建每个 `policy_state` 时，必须以其完整 `K` 重放同一在线候选函数，再执行离线正例和困难负例注入。这样训练记录中的 `candidate_scope=online` 与真实运行时可复现，而 `offline_injected` 仍只存在于训练或 Oracle 评测轨道。
 
 在线候选生成禁止读取参考补丁、测试答案、ContextBench Gold、SWE-Explore core/optional、witness group、教师解释或人工标签。在线 pair 也不能依据 Gold witness 关系构造。
 
