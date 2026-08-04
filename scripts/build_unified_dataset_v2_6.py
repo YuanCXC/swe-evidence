@@ -21,24 +21,34 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from collections import OrderedDict
 from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 
-DATASET_NAME = "unified_swe_dataset_v1"
-DATASET_VERSION = "1.0.0"
+DATASET_NAME = "unified_swe_dataset_v2_6"
+DATASET_VERSION = "2.6.0"
 SCHEMA_VERSION = "1.0"
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.2.6"
+RELEASE_TAG = "v2_6"
+MANIFEST_FILENAME = "manifest_v2_6.json"
+V1_STATE_PATH = Path("data/.build/unified_swe_v1.sqlite3")
+WORKING_STATE_PATH = V1_STATE_PATH
+POLICY_FTS_PATH = Path("data/.build/retriever_v2_2_fts.sqlite3")
+V1_RELEASE_ROOT = Path("data/unified_swe_dataset_v1")
+V2_STAGING_ROOT = Path("data/unified_swe_dataset_v2_6.tmp")
+V2_RELEASE_ROOT = Path("data/unified_swe_dataset_v2_6")
 
 RELEASE_FILES = (
-    "train.parquet",
-    "validation.parquet",
-    "benchmark.parquet",
-    "repository_corpus.parquet",
-    "manifest.json",
+    "train_v2_6.parquet",
+    "validation_v2_6.parquet",
+    "benchmark_v2_6.parquet",
+    "repository_corpus_v2_6.parquet",
+    MANIFEST_FILENAME,
 )
 EXPECTED_SPLIT_COUNTS = {"train": 18_347, "validation": 223, "benchmark": 2_294}
 EXPECTED_RAW_SWEBENCH_COUNTS = {"train": 19_008, "dev": 225, "test": 2_294}
@@ -78,12 +88,35 @@ TEACHER_RELATIONS = (
 )
 
 RETRIEVAL_CHANNELS = ("bm25_content", "path_name", "symbol", "structure")
+RETRIEVER_VERSION = "retriever-v2.6-inplace-stream-fts-lazy-static-q-head-rrf"
+POLICY_PHASE_VERSION = "2.6.0"
 RRF_K = 64
 CHANNEL_DEPTH = 64
 FINAL_DEPTH = 64
+CHANNEL_HEAD_RESERVE = 8
 REGULAR_PAIR_CAP = 8
-ONLINE_FILE_CAP = 32
+PATH_FILE_CAP = 32
+CONTENT_FILE_CAP = 64
+ONLINE_FILE_CAP = PATH_FILE_CAP + CONTENT_FILE_CAP
 ONLINE_UNIT_UNIVERSE_CAP = 4_096
+GIT_GREP_QUERY_TERM_CAP = 12
+GIT_GREP_MATCHES_PER_FILE = 32
+GIT_GREP_MAX_RESULTS = 4_096
+
+
+# V2.2 不再为每个任务执行全仓 git grep；改为一次构建、反复查询的 SQLite FTS5 文件索引。
+POLICY_FILE_FTS_VERSION = "policy-file-fts-v2.2"
+FTS_QUERY_TERM_CAP = 12
+FTS_BUILD_BATCH_SIZE = 2_000
+
+# V2.3 性能参数：减少 SQLite 提交/COUNT(*) 扫描开销。
+POLICY_PROGRESS_TASK_INTERVAL = 10
+POLICY_COMMIT_TASK_INTERVAL = 100
+
+# V2.6：只缓存派生的 policy records / 检索词项，不修改任何监督或语义标签。
+# 2048 个 file_version 通常只占数百 MB；如机器内存紧张可调小。
+POLICY_FILE_RECORD_CACHE_MAX = 2_048
+
 
 TOKENIZER_NAME = "BAAI/bge-reranker-v2-m3"
 TOKENIZER_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
@@ -109,6 +142,10 @@ def _resolve_git_executable() -> str:
 
 
 GIT_EXECUTABLE = _resolve_git_executable()
+
+# 进程内 LRU：同一 file_version 会被大量 snapshots 复用。
+# 值为已经切成 Evidence Unit 的基础 record；每个 task 使用浅拷贝附加 query-specific 元数据。
+_POLICY_FILE_RECORD_CACHE: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
 
 BUILD_PHASES = (
     "sources",
@@ -1731,21 +1768,34 @@ def select_online_file_memberships(
     question: str,
     memberships: Sequence[dict[str, Any]],
     *,
-    cap: int = 32,
+    content_hits: Sequence[dict[str, Any]] = (),
+    content_candidates: Sequence[dict[str, Any]] = (),
+    cap: int = ONLINE_FILE_CAP,
+    path_cap: int = PATH_FILE_CAP,
+    content_cap: int = CONTENT_FILE_CAP,
 ) -> list[dict[str, Any]]:
-    """只根据 q 和 snapshot 路径确定一个可重放的有界文件候选集。"""
+    """V2：独立融合 path shortlist 与 snapshot-aware FTS5 content shortlist。
+
+    关键变化：path 不再是所有检索通道的共同前置门禁。即使问题文本与文件路径
+    没有词面重叠，只要 FTS5 在冻结 pre-fix file version 正文中命中，该文件仍可进入
+    Evidence Unit universe。
+    """
 
     if cap <= 0:
         return []
+    path_cap = max(0, min(path_cap, cap))
+    content_cap = max(0, min(content_cap, cap))
     query_terms = set(_retrieval_terms(question))
     unique = {
-        (str(item["path"]), str(item["file_version_id"])): {
-            "path": str(item["path"]),
+        (str(item["path"]).replace("\\", "/"), str(item["file_version_id"])): {
+            "path": str(item["path"]).replace("\\", "/"),
             "file_version_id": str(item["file_version_id"]),
         }
         for item in memberships
     }
-    ranked: list[tuple[int, int, str, str, dict[str, Any]]] = []
+
+    # 通道 1：路径相关性。保留旧规则，但只作为一个独立入口。
+    path_ranked: list[tuple[int, int, str, str, dict[str, Any]]] = []
     for (path, file_version_id), item in unique.items():
         path_terms = set(_retrieval_terms(path))
         overlap = len(query_terms & path_terms)
@@ -1753,9 +1803,100 @@ def select_online_file_memberships(
         fallback_hash = hashlib.sha256(
             f"{question}\0{path}\0{file_version_id}".encode("utf-8")
         ).hexdigest()
-        ranked.append((-overlap, -substring_hits, fallback_hash, path, item))
-    ranked.sort(key=lambda entry: entry[:4])
-    return [copy.deepcopy(entry[4]) for entry in ranked[:cap]]
+        path_ranked.append((-overlap, -substring_hits, fallback_hash, path, item))
+    path_ranked.sort(key=lambda entry: entry[:4])
+    path_selected = [entry[4] for entry in path_ranked[:path_cap]]
+
+
+    # 通道 2：V2.2 优先使用预构建 FTS5 的 snapshot-aware 正文文件候选。
+    # content_candidates 已按 FTS BM25 排好序，因此这里不再二次改写其相关性次序。
+    content_source = "content_fts_file" if content_candidates else "git_grep_content"
+    hit_by_path: dict[str, dict[str, Any]] = {}
+    content_selected: list[dict[str, Any]] = []
+    if content_candidates:
+        for candidate in content_candidates:
+            key = (
+                str(candidate.get("path") or "").replace("\\", "/"),
+                str(candidate.get("file_version_id") or ""),
+            )
+            item = unique.get(key)
+            if item is not None and item not in content_selected:
+                content_selected.append(item)
+            if len(content_selected) >= content_cap:
+                break
+    else:
+        # 旧 git-grep 路径仅保留给单元测试/调试，不再用于正式 V2.2 policy 构建。
+        for hit in content_hits:
+            path = str(hit.get("path") or "").replace("\\", "/")
+            if not path:
+                continue
+            state = hit_by_path.setdefault(
+                path,
+                {"hit_count": 0, "matched_terms": set(), "hit_lines": []},
+            )
+            state["hit_count"] += 1
+            state["matched_terms"].update(map(str, hit.get("matched_terms") or []))
+            line = int(hit.get("line") or 0)
+            if line > 0:
+                state["hit_lines"].append(line)
+
+        membership_by_path: dict[str, list[dict[str, Any]]] = {}
+        for item in unique.values():
+            membership_by_path.setdefault(str(item["path"]), []).append(item)
+        content_ranked: list[tuple[int, int, int, str, str, dict[str, Any]]] = []
+        for path, hit_state in hit_by_path.items():
+            for item in membership_by_path.get(path, []):
+                first_line = min(hit_state["hit_lines"], default=2**31 - 1)
+                content_ranked.append(
+                    (
+                        -len(hit_state["matched_terms"]),
+                        -int(hit_state["hit_count"]),
+                        first_line,
+                        path,
+                        str(item["file_version_id"]),
+                        item,
+                    )
+                )
+        content_ranked.sort(key=lambda entry: entry[:5])
+        content_selected = [entry[5] for entry in content_ranked[:content_cap]]
+
+    selected_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add_selected(item: dict[str, Any], source: str) -> None:
+        key = (str(item["path"]), str(item["file_version_id"]))
+        selected = selected_by_key.setdefault(
+            key,
+            {
+                "path": key[0],
+                "file_version_id": key[1],
+                "candidate_file_sources": [],
+                "content_hit_lines": [],
+                "content_matched_terms": [],
+            },
+        )
+        if source not in selected["candidate_file_sources"]:
+            selected["candidate_file_sources"].append(source)
+        if source == "git_grep_content":
+            hit_state = hit_by_path.get(key[0]) or {}
+            selected["content_hit_lines"] = sorted(
+                set(map(int, hit_state.get("hit_lines") or []))
+            )
+            selected["content_matched_terms"] = sorted(
+                set(map(str, hit_state.get("matched_terms") or []))
+            )
+
+    for item in path_selected:
+        add_selected(item, "path_name_file")
+    for item in content_selected:
+        add_selected(item, content_source)
+
+    # 先保留两路各自高排名结果，最后按稳定 key 截断到总文件上限。
+    ordered_keys: list[tuple[str, str]] = []
+    for item in [*path_selected, *content_selected]:
+        key = (str(item["path"]), str(item["file_version_id"]))
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+    return [copy.deepcopy(selected_by_key[key]) for key in ordered_keys[:cap]]
 
 
 def flatten_policy_state_records(
@@ -1829,6 +1970,7 @@ def assemble_release_task_record(
     """组装三个任务文件共用的逻辑记录，并完成发布前质量字段。"""
 
     record = copy.deepcopy(task_payload)
+    apply_v2_release_metadata(record)
     released_supervision = copy.deepcopy(supervision)
     released_supervision["policy_states"] = hydrate_policy_states(states, actions)
     record["supervision"] = released_supervision
@@ -2446,8 +2588,16 @@ def build_release_manifest(
             "question_max_tokens": QUESTION_MAX_TOKENS,
         },
         "retrieval": {
+            "version": RETRIEVER_VERSION,
             "channels": list(RETRIEVAL_CHANNELS),
+            "file_retrieval_channels": ["path_name_file", "content_fts_file"],
+            "path_file_cap": PATH_FILE_CAP,
+            "content_file_cap": CONTENT_FILE_CAP,
+            "online_file_cap": ONLINE_FILE_CAP,
+            "online_unit_universe_cap": ONLINE_UNIT_UNIVERSE_CAP,
             "channel_depth": CHANNEL_DEPTH,
+            "channel_head_reserve": CHANNEL_HEAD_RESERVE,
+            "fusion_strategy": "channel_head_preserved_rrf",
             "rrf_k": RRF_K,
             "final_depth": FINAL_DEPTH,
             "online_single_cap": FINAL_DEPTH,
@@ -2526,25 +2676,26 @@ def audit_staged_dataset(
 
     suffix = "parquet" if format_name == "parquet" else "jsonl"
     expected_files = {
-        f"train.{suffix}",
-        f"validation.{suffix}",
-        f"benchmark.{suffix}",
-        f"repository_corpus.{suffix}",
+        f"train_{RELEASE_TAG}.{suffix}",
+        f"validation_{RELEASE_TAG}.{suffix}",
+        f"benchmark_{RELEASE_TAG}.{suffix}",
+        f"repository_corpus_{RELEASE_TAG}.{suffix}",
     }
     actual_files = {path.name for path in root.iterdir() if path.is_file()}
-    if actual_files != expected_files | {"manifest.json"}:
+    if actual_files != expected_files | {MANIFEST_FILENAME}:
         raise ValueError(
-            f"临时发布文件集合错误：expected={sorted(expected_files | {'manifest.json'})}, "
+            f"临时发布文件集合错误：expected={sorted(expected_files | {MANIFEST_FILENAME})}, "
             f"actual={sorted(actual_files)}"
         )
-    manifest_path = root / "manifest.json"
+    manifest_path = root / MANIFEST_FILENAME
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != format_name:
         raise ValueError("Manifest format 与审计格式不一致。")
     expected_rows = {
-        f"{split}.{suffix}": count for split, count in expected_split_counts.items()
+        f"{split}_{RELEASE_TAG}.{suffix}": count
+        for split, count in expected_split_counts.items()
     }
-    expected_rows[f"repository_corpus.{suffix}"] = expected_corpus_count
+    expected_rows[f"repository_corpus_{RELEASE_TAG}.{suffix}"] = expected_corpus_count
     audited_files: dict[str, dict[str, Any]] = {}
     for name in sorted(expected_files):
         path = root / name
@@ -2600,9 +2751,11 @@ def publish_staged_directory(staging_root: Path, target_root: Path) -> Path:
     target_root = target_root.resolve()
     if staging_root.parent != target_root.parent:
         raise ValueError("staging 与 target 必须位于同一父目录以保证原子重命名。")
-    manifest_path = staging_root / "manifest.json"
+    manifest_path = staging_root / MANIFEST_FILENAME
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"staging 缺少 manifest.json：{staging_root}")
+        raise FileNotFoundError(
+            f"staging 缺少 {MANIFEST_FILENAME}：{staging_root}"
+        )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("audit_status") != "passed":
         raise ValueError("临时数据集尚未通过审计，禁止发布。")
@@ -2626,7 +2779,7 @@ def write_unified_dataset(
     state_path: Path,
     *,
     format_name: str,
-    staging_root: Path = Path("data/unified_swe_dataset_v1.tmp"),
+    staging_root: Path = V2_STAGING_ROOT,
 ) -> dict[str, Any]:
     """从冻结 SQLite 流式写出四个数据文件和待审计 Manifest。"""
 
@@ -2657,7 +2810,7 @@ def write_unified_dataset(
     statistics = collect_release_statistics(connection)
     try:
         for split in ("train", "validation", "benchmark"):
-            name = f"{split}.{suffix}"
+            name = f"{split}_{RELEASE_TAG}.{suffix}"
             file_reports[name] = write_record_stream(
                 staging_root / name,
                 iter_release_task_records(connection, split, tokenizer=tokenizer),
@@ -2667,16 +2820,42 @@ def write_unified_dataset(
                 progress_label=split,
                 progress_every=250,
             )
-        corpus_name = f"repository_corpus.{suffix}"
-        file_reports[corpus_name] = write_record_stream(
-            staging_root / corpus_name,
-            iter_release_corpus_records(connection),
-            format_name=format_name,
-            schema=release_corpus_arrow_schema(),
-            batch_size=32 if format_name == "parquet" else 1,
-            progress_label="repository_corpus",
-            progress_every=10_000,
-        )
+        corpus_name = f"repository_corpus_{RELEASE_TAG}.{suffix}"
+        corpus_target = staging_root / corpus_name
+        v1_corpus = V1_RELEASE_ROOT / "repository_corpus.parquet"
+        if format_name == "parquet" and v1_corpus.is_file():
+            # V2.2 没有改变 corpus 语义，只允许 hardlink 复用，禁止静默复制 7.3GB。
+            try:
+                os.link(v1_corpus.resolve(), corpus_target)
+                reuse_mode = "hardlink_v1_corpus"
+            except OSError as error:
+                raise RuntimeError(
+                    "无法为 V2.2 corpus 创建 hardlink。为避免额外复制约 7.3GB，"
+                    "本脚本不会自动 fallback 到 copy。请确认 V1/V2.2 位于同一 NTFS/POSIX 文件系统。"
+                ) from error
+            import pyarrow.parquet as pq
+
+            row_count = int(pq.ParquetFile(corpus_target).metadata.num_rows)
+            file_reports[corpus_name] = {
+                "file": corpus_name,
+                "row_count": row_count,
+                "size_bytes": corpus_target.stat().st_size,
+                "sha256": _sha256_file(corpus_target),
+            }
+            print(
+                f"write repository_corpus_v2.2: reused v1 via {reuse_mode}",
+                flush=True,
+            )
+        else:
+            file_reports[corpus_name] = write_record_stream(
+                corpus_target,
+                iter_release_corpus_records(connection),
+                format_name=format_name,
+                schema=release_corpus_arrow_schema(),
+                batch_size=32 if format_name == "parquet" else 1,
+                progress_label="repository_corpus_v2",
+                progress_every=10_000,
+            )
     finally:
         connection.close()
     manifest = build_release_manifest(
@@ -2686,7 +2865,7 @@ def write_unified_dataset(
         teacher_report=teacher_report,
         statistics=statistics,
     )
-    (staging_root / "manifest.json").write_text(
+    (staging_root / MANIFEST_FILENAME).write_text(
         stable_json_dumps(manifest) + "\n", encoding="utf-8", newline="\n"
     )
     connection = open_state_database(state_path)
@@ -2745,25 +2924,37 @@ def record_release_phase(
 def policy_records_from_file_payload(
     file_record: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """把文件记录中的 scoreable unit 转成策略检索所需的有界正文记录。"""
+    """V2.6：把 scoreable unit 转成轻量策略记录。
+
+    这里故意不再提前计算：
+    - content retrieval terms / counts
+    - path / symbol retrieval terms
+    - candidate rendered body
+
+    这些字段只在真正进入 4096-unit universe 或成为 action 时按需计算。
+    这样避免对随后会被 universe trim 丢掉的大量 Evidence Unit 做重复文本处理。
+    """
 
     content_lines = str(file_record.get("content") or "").splitlines()
     records: list[dict[str, Any]] = []
+    path_text = str(file_record["path"])
+    file_version_id = str(file_record["file_version_id"])
     for unit in file_record.get("evidence_units") or []:
         if not unit.get("scoreable"):
             continue
         start_line = max(1, int(unit.get("start_line") or 1))
         end_line = max(start_line, int(unit.get("end_line") or start_line))
+        content = "\n".join(content_lines[start_line - 1 : end_line])
         records.append(
             {
                 "evidence_id": str(unit["evidence_id"]),
-                "file_version_id": str(file_record["file_version_id"]),
-                "path": str(file_record["path"]),
+                "file_version_id": file_version_id,
+                "path": path_text,
                 "unit_type": str(unit.get("unit_type") or "code_block"),
                 "symbol": unit.get("qualified_name") or unit.get("symbol"),
                 "start_line": start_line,
                 "end_line": end_line,
-                "content": "\n".join(content_lines[start_line - 1 : end_line]),
+                "content": content,
                 "rendered_token_count": int(unit.get("rendered_token_count") or 0),
                 "scoreable": True,
                 "parent_evidence_id": unit.get("parent_evidence_id"),
@@ -2779,6 +2970,53 @@ def policy_records_from_file_payload(
     )
     return records
 
+
+
+def _policy_file_records_cache_get(file_version_id: str) -> list[dict[str, Any]] | None:
+    records = _POLICY_FILE_RECORD_CACHE.get(file_version_id)
+    if records is None:
+        return None
+    _POLICY_FILE_RECORD_CACHE.move_to_end(file_version_id)
+    return records
+
+
+def _policy_file_records_cache_put(
+    file_version_id: str, records: list[dict[str, Any]]
+) -> None:
+    _POLICY_FILE_RECORD_CACHE[file_version_id] = records
+    _POLICY_FILE_RECORD_CACHE.move_to_end(file_version_id)
+    while len(_POLICY_FILE_RECORD_CACHE) > POLICY_FILE_RECORD_CACHE_MAX:
+        _POLICY_FILE_RECORD_CACHE.popitem(last=False)
+
+
+def _load_cached_policy_records(
+    connection: sqlite3.Connection, file_version_ids: Sequence[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """批量读取尚未命中 LRU 的 file_version，并缓存 Evidence Unit 展开结果。"""
+
+    ordered_ids = list(dict.fromkeys(map(str, file_version_ids)))
+    result: dict[str, list[dict[str, Any]]] = {}
+    missing: list[str] = []
+    for file_version_id in ordered_ids:
+        cached = _policy_file_records_cache_get(file_version_id)
+        if cached is None:
+            missing.append(file_version_id)
+        else:
+            result[file_version_id] = cached
+
+    for offset in range(0, len(missing), 800):
+        chunk = missing[offset : offset + 800]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in connection.execute(
+            f"SELECT file_version_id, payload_json FROM file_versions "
+            f"WHERE file_version_id IN ({placeholders})",
+            chunk,
+        ):
+            file_version_id = str(row["file_version_id"])
+            records = policy_records_from_file_payload(json.loads(row["payload_json"]))
+            _policy_file_records_cache_put(file_version_id, records)
+            result[file_version_id] = records
+    return result
 
 def build_policy_structural_edges(
     evidence_by_id: dict[str, dict[str, Any]],
@@ -3837,22 +4075,40 @@ def reciprocal_rank_fusion(
     *,
     depth: int = FINAL_DEPTH,
     rrf_k: int = RRF_K,
+    channel_head_reserve: int = CHANNEL_HEAD_RESERVE,
 ) -> list[dict[str, Any]]:
-    """按冻结通道顺序执行不归一化的等权 Reciprocal Rank Fusion。"""
+    """V2：保护每个通道头部候选，再用等权 RRF 填满最终候选集。
 
+    旧版纯 RRF 会把“单通道 rank 很高”的候选挤出 Top-64。V2 不改变 RRF
+    分数，只改变最终集合选择：每个非空通道先保留少量 head，再由 RRF 排名补齐。
+    最终集合仍按 RRF 分数稳定排序，因此 online_retrieval_rank 仍可解释。
+    """
+
+    if depth <= 0:
+        return []
     ranks_by_id: dict[str, dict[str, int]] = {}
+    normalized_channels: dict[str, list[str]] = {}
     for channel in RETRIEVAL_CHANNELS:
         seen: set[str] = set()
+        normalized: list[str] = []
         for rank, evidence_id in enumerate(channel_results.get(channel, ()), 1):
             evidence_id = str(evidence_id)
             if evidence_id in seen or rank > CHANNEL_DEPTH:
                 continue
             seen.add(evidence_id)
+            normalized.append(evidence_id)
             ranks_by_id.setdefault(evidence_id, {})[channel] = rank
-    fused: list[dict[str, Any]] = []
+        normalized_channels[channel] = normalized
+
+    fused_all: list[dict[str, Any]] = []
     for evidence_id, ranks in ranks_by_id.items():
         sources = [channel for channel in RETRIEVAL_CHANNELS if channel in ranks]
-        fused.append(
+        protected_by = [
+            channel
+            for channel in sources
+            if channel_head_reserve > 0 and ranks[channel] <= channel_head_reserve
+        ]
+        fused_all.append(
             {
                 "evidence_id": evidence_id,
                 "candidate_sources": sources,
@@ -3861,16 +4117,50 @@ def reciprocal_rank_fusion(
                 "online_retrieval_score": sum(
                     1.0 / (rrf_k + ranks[channel]) for channel in sources
                 ),
+                "protected_by_channel_head": protected_by,
             }
         )
-    fused.sort(
-        key=lambda item: (
+
+    def fused_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        return (
             -item["online_retrieval_score"],
             item["best_source_rank"],
             item["evidence_id"],
         )
-    )
-    fused = fused[:depth]
+
+    fused_all.sort(key=fused_key)
+    by_id = {str(item["evidence_id"]): item for item in fused_all}
+
+    protected_ids: list[str] = []
+    if channel_head_reserve > 0:
+        for channel in RETRIEVAL_CHANNELS:
+            for evidence_id in normalized_channels[channel][:channel_head_reserve]:
+                if evidence_id not in protected_ids:
+                    protected_ids.append(evidence_id)
+
+    # 正常配置下 4*8<=64。若未来配置导致 protected 超过 depth，按
+    # best-source-rank + RRF 稳定裁剪，避免输出超过 final depth。
+    if len(protected_ids) > depth:
+        protected_ids = [
+            item["evidence_id"]
+            for item in sorted(
+                (by_id[evidence_id] for evidence_id in protected_ids),
+                key=lambda item: (
+                    item["best_source_rank"],
+                    -item["online_retrieval_score"],
+                    item["evidence_id"],
+                ),
+            )[:depth]
+        ]
+
+    selected_ids = set(protected_ids)
+    for item in fused_all:
+        if len(selected_ids) >= depth:
+            break
+        selected_ids.add(str(item["evidence_id"]))
+
+    fused = [item for item in fused_all if str(item["evidence_id"]) in selected_ids]
+    fused.sort(key=fused_key)
     for rank, item in enumerate(fused, 1):
         item["online_retrieval_rank"] = rank
     return fused
@@ -4305,19 +4595,33 @@ def retrieve_online_channels(
     query_terms = list(dict.fromkeys(_retrieval_terms(question)))
     query_set = set(query_terms)
     doc_terms: dict[str, list[str]] = {}
+    doc_term_sets: dict[str, set[str]] = {}
+    doc_term_counts: dict[str, dict[str, int]] = {}
+    doc_lengths: dict[str, int] = {}
     for record in visible:
-        cached_terms = record.get("_content_retrieval_terms")
-        if cached_terms is None:
-            cached_terms = _retrieval_terms(str(record.get("content") or ""))
-            record["_content_retrieval_terms"] = cached_terms
-        doc_terms[str(record["evidence_id"])] = cached_terms
-    doc_term_sets = {
-        evidence_id: set(terms) for evidence_id, terms in doc_terms.items()
-    }
+        evidence_id = str(record["evidence_id"])
+        terms = record.get("_content_retrieval_terms")
+        if terms is None:
+            terms = _retrieval_terms(str(record.get("content") or ""))
+            record["_content_retrieval_terms"] = terms
+        term_set = record.get("_content_retrieval_term_set")
+        if term_set is None:
+            term_set = set(terms)
+            record["_content_retrieval_term_set"] = term_set
+        counts = record.get("_content_retrieval_term_counts")
+        if counts is None:
+            counts = {}
+            for term in terms:
+                counts[term] = counts.get(term, 0) + 1
+            record["_content_retrieval_term_counts"] = counts
+        length = int(record.get("_content_retrieval_length") or len(terms))
+        record["_content_retrieval_length"] = length
+        doc_terms[evidence_id] = terms
+        doc_term_sets[evidence_id] = term_set
+        doc_term_counts[evidence_id] = counts
+        doc_lengths[evidence_id] = length
     document_count = max(1, len(visible))
-    average_length = (
-        sum(len(terms) for terms in doc_terms.values()) / document_count or 1.0
-    )
+    average_length = (sum(doc_lengths.values()) / document_count or 1.0)
     document_frequency = {
         term: sum(term in terms for terms in doc_term_sets.values())
         for term in query_terms
@@ -4326,9 +4630,7 @@ def retrieve_online_channels(
     for evidence_id, terms in doc_terms.items():
         if not terms:
             continue
-        counts: dict[str, int] = {}
-        for term in terms:
-            counts[term] = counts.get(term, 0) + 1
+        counts = doc_term_counts[evidence_id]
         score = 0.0
         for term in query_terms:
             frequency = counts.get(term, 0)
@@ -4337,7 +4639,7 @@ def retrieve_online_channels(
             df = document_frequency[term]
             inverse_frequency = math.log(1.0 + (document_count - df + 0.5) / (df + 0.5))
             denominator = frequency + 1.2 * (
-                1.0 - 0.75 + 0.75 * len(terms) / average_length
+                1.0 - 0.75 + 0.75 * doc_lengths[evidence_id] / average_length
             )
             score += inverse_frequency * frequency * 2.2 / denominator
         if score > 0:
@@ -4381,6 +4683,316 @@ def retrieve_online_channels(
     }
 
 
+
+
+def precompute_task_query_channel_rankings(
+    question: str,
+    evidence_records: Sequence[dict[str, Any]],
+) -> dict[str, list[str]]:
+    """V2.6：BM25/path/symbol 是 q-only 通道，每个 task 只完整排序一次。
+
+    state K 只影响：
+    - 已选择 Evidence 的过滤
+    - structure(K) 通道
+
+    这比每个 initial/complete/boundary state 都重新计算 BM25 IDF 和排序更符合
+    q-only / state-aware 通道分工，也显著减少重复计算。
+    """
+
+    depth = max(1, len(evidence_records))
+    channels = retrieve_online_channels(
+        question,
+        evidence_records,
+        state_evidence_ids=(),
+        structural_edges=None,
+        channel_depth=depth,
+    )
+    return {
+        "bm25_content": list(channels.get("bm25_content") or []),
+        "path_name": list(channels.get("path_name") or []),
+        "symbol": list(channels.get("symbol") or []),
+    }
+
+
+def task_query_channels_for_state(
+    *,
+    precomputed_rankings: dict[str, Sequence[str]],
+    visible_ids: set[str],
+    selected_ids: set[str],
+    structural_edges: dict[str, Sequence[str]],
+    channel_depth: int = CHANNEL_DEPTH,
+) -> dict[str, list[str]]:
+    """从 task 级 q-only 排名中筛出当前 state 可见候选，并动态计算 structure(K)。"""
+
+    allowed = visible_ids - selected_ids
+    result = {
+        channel: [
+            evidence_id
+            for evidence_id in precomputed_rankings.get(channel, ())
+            if evidence_id in allowed
+        ][:channel_depth]
+        for channel in ("bm25_content", "path_name", "symbol")
+    }
+
+    edge_counts: dict[str, int] = {}
+    for source in sorted(selected_ids):
+        for target in structural_edges.get(source, ()):
+            target = str(target)
+            if target in allowed:
+                edge_counts[target] = edge_counts.get(target, 0) + 1
+    result["structure"] = sorted(
+        edge_counts,
+        key=lambda evidence_id: (-edge_counts[evidence_id], evidence_id),
+    )[:channel_depth]
+    return result
+
+
+def _policy_file_fts_repo_token(repo: str) -> str:
+    """为仓库生成只含字母数字的稳定 FTS token。"""
+
+    digest = hashlib.sha1(repo.lower().encode("utf-8")).hexdigest()[:20]
+    return f"repo{digest}"
+
+
+def _policy_file_fts_quote(term: str) -> str:
+    """安全构造 FTS5 phrase。"""
+
+    return '"' + term.replace('"', '""') + '"'
+
+
+def open_policy_file_fts_sidecar(
+    state_path: Path,
+    *,
+    index_path: Path = POLICY_FTS_PATH,
+) -> tuple[sqlite3.Connection, dict[str, Any]]:
+    """打开/构建独立 FTS5 sidecar，不让 60GB working SQLite 因索引膨胀。
+
+    sidecar 作为主连接写入；V1 working DB 以 mode=ro 附加为 state_db。
+    因而正文索引构建和 snapshot-aware 查询都不会写 corpus/supervision。
+    """
+
+    state_path = state_path.resolve()
+    index_path = index_path.resolve()
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_uri = index_path.as_uri() + "?mode=rwc"
+    connection = sqlite3.connect(index_uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    # sidecar 查询属于可再生构建缓存，使用 NORMAL 同步降低 Windows I/O 开销。
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    connection.execute("PRAGMA cache_size=-131072")
+    state_uri = state_path.as_uri() + "?mode=ro"
+    connection.execute("ATTACH DATABASE ? AS state_db", (state_uri,))
+
+    source_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM state_db.file_versions "
+            "WHERE status='materialized_searchable'"
+        ).fetchone()[0]
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS policy_file_fts_meta "
+        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    meta = {
+        str(row["key"]): str(row["value"])
+        for row in connection.execute("SELECT key, value FROM policy_file_fts_meta")
+    }
+    if (
+        meta.get("version") == POLICY_FILE_FTS_VERSION
+        and meta.get("source_count") == str(source_count)
+        and meta.get("completed") == "1"
+    ):
+        indexed_count = int(meta.get("indexed_count") or 0)
+        print(
+            f"retrieval-index-v2.2: reuse {indexed_count}/{source_count} searchable files "
+            f"from {index_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return connection, {
+            "version": POLICY_FILE_FTS_VERSION,
+            "source_count": source_count,
+            "indexed_count": indexed_count,
+            "reused": True,
+            "index_path": str(index_path),
+        }
+
+    print(
+        f"retrieval-index-v2.2: building sidecar FTS5 for {source_count} searchable files "
+        f"at {index_path}",
+        file=sys.stderr,
+        flush=True,
+    )
+    connection.execute("DROP TABLE IF EXISTS policy_file_fts")
+    connection.execute("DROP TABLE IF EXISTS policy_file_fts_map")
+    connection.execute("DELETE FROM policy_file_fts_meta")
+    connection.execute(
+        "CREATE TABLE policy_file_fts_map ("
+        "rowid INTEGER PRIMARY KEY, "
+        "file_version_id TEXT UNIQUE NOT NULL, "
+        "repo TEXT NOT NULL, "
+        "path TEXT NOT NULL)"
+    )
+    try:
+        connection.execute(
+            "CREATE VIRTUAL TABLE policy_file_fts USING fts5("
+            "repo_token, path, content, content='')"
+        )
+    except sqlite3.OperationalError as error:
+        connection.close()
+        raise RuntimeError(
+            "当前 Python/SQLite 未启用 FTS5，无法运行 Retriever V2.2。"
+        ) from error
+    connection.commit()
+
+    map_batch: list[tuple[int, str, str, str]] = []
+    fts_batch: list[tuple[int, str, str, str]] = []
+    indexed_count = 0
+    scanned_count = 0
+    cursor = connection.execute(
+        "SELECT file_version_id, repo, path, payload_json FROM state_db.file_versions "
+        "WHERE status='materialized_searchable' ORDER BY file_version_id"
+    )
+    for row in cursor:
+        scanned_count += 1
+        payload = json.loads(row["payload_json"])
+        content = str(payload.get("content") or "")
+        if not content:
+            continue
+        indexed_count += 1
+        repo = str(row["repo"] or payload.get("repo") or "")
+        path = str(row["path"] or payload.get("path") or "").replace("\\", "/")
+        map_batch.append((indexed_count, str(row["file_version_id"]), repo, path))
+        fts_batch.append(
+            (indexed_count, _policy_file_fts_repo_token(repo), path, content)
+        )
+        if len(map_batch) >= FTS_BUILD_BATCH_SIZE:
+            connection.executemany(
+                "INSERT INTO policy_file_fts_map "
+                "(rowid, file_version_id, repo, path) VALUES (?, ?, ?, ?)",
+                map_batch,
+            )
+            connection.executemany(
+                "INSERT INTO policy_file_fts "
+                "(rowid, repo_token, path, content) VALUES (?, ?, ?, ?)",
+                fts_batch,
+            )
+            connection.commit()
+            map_batch.clear()
+            fts_batch.clear()
+            print(
+                f"retrieval-index-v2.2: {scanned_count}/{source_count} files, "
+                f"indexed={indexed_count}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if map_batch:
+        connection.executemany(
+            "INSERT INTO policy_file_fts_map "
+            "(rowid, file_version_id, repo, path) VALUES (?, ?, ?, ?)",
+            map_batch,
+        )
+        connection.executemany(
+            "INSERT INTO policy_file_fts "
+            "(rowid, repo_token, path, content) VALUES (?, ?, ?, ?)",
+            fts_batch,
+        )
+        connection.commit()
+
+    connection.executemany(
+        "INSERT OR REPLACE INTO policy_file_fts_meta (key, value) VALUES (?, ?)",
+        [
+            ("version", POLICY_FILE_FTS_VERSION),
+            ("source_count", str(source_count)),
+            ("indexed_count", str(indexed_count)),
+            ("completed", "1"),
+        ],
+    )
+    connection.commit()
+    print(
+        f"retrieval-index-v2.2: complete indexed={indexed_count}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return connection, {
+        "version": POLICY_FILE_FTS_VERSION,
+        "source_count": source_count,
+        "indexed_count": indexed_count,
+        "reused": False,
+        "index_path": str(index_path),
+    }
+
+
+
+def query_policy_file_fts(
+    fts_connection: sqlite3.Connection,
+    *,
+    repo: str,
+    question: str,
+    membership_file_ids: set[str],
+    cap: int = CONTENT_FILE_CAP,
+) -> list[dict[str, Any]]:
+    """V2.6：恢复已验证更快的 FTS 流式排序 + snapshot membership 过滤。
+
+    V2.5 的：
+        MATCH + rowid IN(current snapshot chunk)
+    在 FTS5 上导致极高查询成本（实测 universe_fts 1514.5s / 100 tasks）。
+
+    V2.6 恢复：
+        repo + query 的 FTS5 全局相关性流
+        -> Python set membership 判断是否属于当前 snapshot
+        -> 收集满 content cap 即停止
+
+    同时保留 V2.5 已经验证有效的：
+    - lazy Evidence record features
+    - task-level q-only channel precompute
+    - render token-count reuse
+    """
+
+    if cap <= 0 or not membership_file_ids:
+        return []
+
+    terms = list(dict.fromkeys(_retrieval_terms(question)))
+    terms = sorted(terms, key=lambda term: (-len(term), term))[:FTS_QUERY_TERM_CAP]
+    if not terms:
+        return []
+
+    match_query = (
+        _policy_file_fts_quote(_policy_file_fts_repo_token(repo))
+        + " AND ("
+        + " OR ".join(_policy_file_fts_quote(term) for term in terms)
+        + ")"
+    )
+
+    cursor = fts_connection.execute(
+        "SELECT map.file_version_id, map.path, policy_file_fts.rank AS fts_score "
+        "FROM policy_file_fts "
+        "JOIN policy_file_fts_map AS map ON map.rowid=policy_file_fts.rowid "
+        "WHERE policy_file_fts MATCH ? "
+        "AND rank MATCH 'bm25(0.0, 1.5, 1.0)' "
+        "ORDER BY rank ASC, policy_file_fts.rowid ASC",
+        (match_query,),
+    )
+
+    selected: list[dict[str, Any]] = []
+    for row in cursor:
+        file_version_id = str(row["file_version_id"])
+        if file_version_id not in membership_file_ids:
+            continue
+        selected.append(
+            {
+                "path": str(row["path"]),
+                "file_version_id": file_version_id,
+                "fts_score": float(row["fts_score"]),
+            }
+        )
+        if len(selected) >= cap:
+            break
+    return selected
+
+
 def git_grep_snapshot_hits(
     git_dir: Path,
     commit: str,
@@ -4391,7 +5003,9 @@ def git_grep_snapshot_hits(
     """在冻结 commit 上有界读取问题词命中，不检出工作区或修复后正文。"""
 
     terms = list(dict.fromkeys(_retrieval_terms(question)))
-    terms = sorted(terms, key=lambda term: (-len(term), term))[:8]
+    terms = sorted(terms, key=lambda term: (-len(term), term))[
+        :GIT_GREP_QUERY_TERM_CAP
+    ]
     if not terms:
         return []
     command = [
@@ -4402,11 +5016,14 @@ def git_grep_snapshot_hits(
         "-I",
         "-i",
         "-m",
-        "32",
+        str(GIT_GREP_MATCHES_PER_FILE),
     ]
     for term in terms:
         command.extend(["-e", term])
     command.extend([commit, "--"])
+    environment = os.environ.copy()
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment.setdefault("GIT_TERMINAL_PROMPT", "0")
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -4414,6 +5031,7 @@ def git_grep_snapshot_hits(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=environment,
         creationflags=WINDOWS_NO_WINDOW,
     )
     hits: list[dict[str, Any]] = []
@@ -4599,10 +5217,25 @@ def render_policy_model_inputs(
     tokenizer: Any,
     model_max_length: int = MODEL_MAX_LENGTH,
     question_max_tokens: int = QUESTION_MAX_TOKENS,
+    precomputed_question_view: str | None = None,
+    precomputed_question_token_count: int | None = None,
 ) -> list[dict[str, Any]]:
-    """批量渲染同一状态的候选，语义与单条渲染完全一致。"""
+    """V2.6：批量渲染，并复用 body-fit 过程中已经得到的精确 token count。
 
-    question_view = _truncate_question_view(question, tokenizer, question_max_tokens)
+    原实现对 complete/boundary state：
+      1) 为每个 K body trial 做 batch tokenize；
+      2) body 选择结束后，又把最终完整文本全部 tokenize 一遍。
+
+    V2.5 保存每个候选最近一次“已接受 body”的精确 token count。
+    只有从未接受任何 body 的候选才补一次 no-body tokenization。
+    文本模板、tokenizer、scoreable 判定均不改变。
+    """
+
+    question_view = (
+        precomputed_question_view
+        if precomputed_question_view is not None
+        else _truncate_question_view(question, tokenizer, question_max_tokens)
+    )
     state_metadata = "\n".join(
         _evidence_metadata(evidence_by_id[evidence_id])
         for evidence_id in state_evidence_ids
@@ -4610,7 +5243,10 @@ def render_policy_model_inputs(
     candidates = [
         (
             "\n\n".join(
-                _render_evidence_body(evidence_by_id[evidence_id])
+                str(
+                    evidence_by_id[evidence_id].get("_model_candidate_body")
+                    or _render_evidence_body(evidence_by_id[evidence_id])
+                )
                 for evidence_id in evidence_ids
             )
             if evidence_ids
@@ -4632,28 +5268,48 @@ def render_policy_model_inputs(
             f"[CANDIDATE ACTION]\n{candidate}"
         )
 
-    selected_body_ids: list[list[str]] = [
-        [] for _ in candidate_evidence_ids
+    selected_body_ids: list[list[str]] = [[] for _ in candidate_evidence_ids]
+    exact_token_counts: list[int | None] = [None for _ in candidate_evidence_ids]
+
+    if state_evidence_ids:
+        for evidence_id in reversed(list(state_evidence_ids)):
+            trial_bodies = [
+                [evidence_id, *body_ids] for body_ids in selected_body_ids
+            ]
+            trial_texts = [
+                compose(body_ids, candidate)
+                for body_ids, candidate in zip(trial_bodies, candidates)
+            ]
+            trial_counts = _batch_model_token_counts(tokenizer, trial_texts)
+            for index, token_count in enumerate(trial_counts):
+                if token_count <= model_max_length:
+                    selected_body_ids[index] = trial_bodies[index]
+                    exact_token_counts[index] = int(token_count)
+
+    # 对从未接受任何 K body 的候选，只补算最终 no-body 文本。
+    missing_indexes = [
+        index for index, token_count in enumerate(exact_token_counts)
+        if token_count is None
     ]
-    for evidence_id in reversed(list(state_evidence_ids)):
-        trial_bodies = [
-            [evidence_id, *body_ids] for body_ids in selected_body_ids
+    if missing_indexes:
+        missing_texts = [
+            compose(selected_body_ids[index], candidates[index])
+            for index in missing_indexes
         ]
-        trial_texts = [
-            compose(body_ids, candidate)
-            for body_ids, candidate in zip(trial_bodies, candidates)
-        ]
-        for index, token_count in enumerate(
-            _batch_model_token_counts(tokenizer, trial_texts)
-        ):
-            if token_count <= model_max_length:
-                selected_body_ids[index] = trial_bodies[index]
+        missing_counts = _batch_model_token_counts(tokenizer, missing_texts)
+        for index, token_count in zip(missing_indexes, missing_counts):
+            exact_token_counts[index] = int(token_count)
+
     texts = [
         compose(body_ids, candidate)
         for body_ids, candidate in zip(selected_body_ids, candidates)
     ]
-    token_counts = _batch_model_token_counts(tokenizer, texts)
-    model_question_token_count = _model_token_count(tokenizer, question_view)
+    token_counts = [int(value or 0) for value in exact_token_counts]
+    model_question_token_count = (
+        int(precomputed_question_token_count)
+        if precomputed_question_token_count is not None
+        else _model_token_count(tokenizer, question_view)
+    )
     return [
         {
             "text": text,
@@ -4680,6 +5336,7 @@ def build_task_policy_states(
     tokenizer: Any,
     online_single_cap: int,
     model_max_length: int = MODEL_MAX_LENGTH,
+    profile: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """把在线候选与离线 witness 注入组装为完整、可训练的任务状态。"""
 
@@ -4693,6 +5350,19 @@ def build_task_policy_states(
         for evidence_id in dict.fromkeys(map(str, online_evidence_ids))
         if evidence_id in evidence_by_id
     ]
+    question_view = _truncate_question_view(question, tokenizer, QUESTION_MAX_TOKENS)
+    question_token_count = _model_token_count(tokenizer, question_view)
+
+    task_retrieval_started = time.perf_counter()
+    precomputed_query_rankings = precompute_task_query_channel_rankings(
+        question,
+        list(evidence_by_id.values()),
+    )
+    if profile is not None:
+        profile["states_query_precompute"] = profile.get(
+            "states_query_precompute", 0.0
+        ) + (time.perf_counter() - task_retrieval_started)
+
     states: list[dict[str, Any]] = []
     for seed in seeds:
         selected = set(seed["evidence_ids"])
@@ -4704,10 +5374,11 @@ def build_task_policy_states(
         }
         visible_ids = list(dict.fromkeys([*base_ids, *sorted(expanded_ids)]))
         visible_records = [evidence_by_id[evidence_id] for evidence_id in visible_ids]
-        channels = retrieve_online_channels(
-            question,
-            visible_records,
-            state_evidence_ids=seed["evidence_ids"],
+        state_stage_started = time.perf_counter()
+        channels = task_query_channels_for_state(
+            precomputed_rankings=precomputed_query_rankings,
+            visible_ids=set(visible_ids),
+            selected_ids=selected,
             structural_edges=structural_edges,
         )
         fused = reciprocal_rank_fusion(
@@ -4715,7 +5386,12 @@ def build_task_policy_states(
         )
         online_ids = [item["evidence_id"] for item in fused]
         fused_by_id = {item["evidence_id"]: item for item in fused}
+        if profile is not None:
+            profile["states_retrieval"] = profile.get("states_retrieval", 0.0) + (
+                time.perf_counter() - state_stage_started
+            )
 
+        state_stage_started = time.perf_counter()
         injected_ids: list[str] = []
         required_pairs: list[tuple[str, str]] = []
         overflow_reasons: set[str] = set()
@@ -4813,6 +5489,11 @@ def build_task_policy_states(
                 ]
             retained_actions.append(action)
 
+        if profile is not None:
+            profile["states_label"] = profile.get("states_label", 0.0) + (
+                time.perf_counter() - state_stage_started
+            )
+        state_stage_started = time.perf_counter()
         rendered_actions = render_policy_model_inputs(
             question=question,
             state_evidence_ids=seed["evidence_ids"],
@@ -4822,7 +5503,14 @@ def build_task_policy_states(
             evidence_by_id=evidence_by_id,
             tokenizer=tokenizer,
             model_max_length=model_max_length,
+            precomputed_question_view=question_view,
+            precomputed_question_token_count=question_token_count,
         )
+        if profile is not None:
+            profile["states_render"] = profile.get("states_render", 0.0) + (
+                time.perf_counter() - state_stage_started
+            )
+        state_stage_started = time.perf_counter()
         for action, rendered in zip(retained_actions, rendered_actions):
             action["model_input_token_count"] = rendered["model_input_token_count"]
             action["rendered_state_body_evidence_ids"] = rendered[
@@ -4881,6 +5569,10 @@ def build_task_policy_states(
             ),
         }
         states.append(state)
+        if profile is not None:
+            profile["states_finalize"] = profile.get("states_finalize", 0.0) + (
+                time.perf_counter() - state_stage_started
+            )
     return states
 
 
@@ -5426,6 +6118,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--through-phase", choices=BUILD_PHASES, help="执行到指定内部阶段后停止。")
     parser.add_argument("--self-test", action="store_true", help="运行脚本内置契约与单元测试。")
     parser.add_argument(
+        "--confirm-inplace-policy-rebuild",
+        action="store_true",
+        help=(
+            "确认允许在 unified_swe_v1.sqlite3 上删除并重建 policy_states / "
+            "candidate_actions；不会修改冻结 V1 发布目录。"
+        ),
+    )
+    parser.add_argument(
+        "--max-policy-tasks",
+        type=int,
+        default=None,
+        help=(
+            "仅用于性能试跑：本次最多新构建多少个 policy task。"
+            "同一 V2.3 fingerprint 下再次运行会从 SQLite 断点继续。"
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=DEFAULT_CORPUS_WORKERS,
@@ -5506,10 +6215,14 @@ def normalize_swebench_task(record: dict[str, Any], upstream_split: str) -> dict
                     "original_source_id": source_id,
                 }
             ],
-            "targets": ["code_repair", "evidence_localization", "evidence_sufficiency"],
+            "targets": [
+                "evidence_localization",
+                "evidence_acquisition",
+                "evidence_sufficiency",
+            ],
             "gold_visibility": "evaluator_only",
             "timeout_seconds": 1_800,
-            "execution_required": True,
+            "execution_required": False,
         }
 
     return {
@@ -7407,39 +8120,106 @@ def _load_policy_evidence_universe(
     snapshot_id: str,
     question: str,
     witness_evidence_ids: Sequence[str],
+    repo_cache_index: dict[str, Path] | None = None,
+    fts_connection: sqlite3.Connection | None = None,
+    profile: dict[str, float] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """加载仅由 q/snapshot 选出的在线 universe，并另行补齐离线 witness。"""
+    """V2.6：path + snapshot-aware sidecar FTS5 两路文件召回，另行补齐离线 witness。"""
 
+    stage_started = time.perf_counter()
     membership_rows = connection.execute(
         "SELECT path, file_version_id FROM snapshot_file_memberships "
         "WHERE snapshot_id=? ORDER BY path",
         (snapshot_id,),
     ).fetchall()
+    snapshot_row = connection.execute(
+        "SELECT repo FROM snapshots WHERE snapshot_id=?",
+        (snapshot_id,),
+    ).fetchone()
+    if snapshot_row is None:
+        raise ValueError(f"policy snapshot 不存在：{snapshot_id}")
+    repo = str(snapshot_row["repo"])
+    if profile is not None:
+        profile["universe_membership"] = profile.get("universe_membership", 0.0) + (
+            time.perf_counter() - stage_started
+        )
+    if fts_connection is None:
+        raise ValueError("V2.6 policy universe 需要已打开的 sidecar FTS connection。")
+    membership_file_ids = {
+        str(row["file_version_id"]) for row in membership_rows
+    }
+    stage_started = time.perf_counter()
+    content_candidates = query_policy_file_fts(
+        fts_connection,
+        repo=repo,
+        question=question,
+        membership_file_ids=membership_file_ids,
+        cap=CONTENT_FILE_CAP,
+    )
+    if profile is not None:
+        profile["universe_fts"] = profile.get("universe_fts", 0.0) + (
+            time.perf_counter() - stage_started
+        )
+
+    stage_started = time.perf_counter()
     selected_memberships = select_online_file_memberships(
         question,
         [dict(row) for row in membership_rows],
+        content_candidates=content_candidates,
         cap=ONLINE_FILE_CAP,
+        path_cap=PATH_FILE_CAP,
+        content_cap=CONTENT_FILE_CAP,
     )
-    selected_file_ids = [item["file_version_id"] for item in selected_memberships]
-    file_cache: dict[str, dict[str, Any]] = {}
-    if selected_file_ids:
-        placeholders = ",".join("?" for _ in selected_file_ids)
-        for row in connection.execute(
-            f"SELECT file_version_id, payload_json FROM file_versions "
-            f"WHERE file_version_id IN ({placeholders})",
-            selected_file_ids,
-        ):
-            file_cache[str(row["file_version_id"])] = json.loads(row["payload_json"])
+    selected_file_ids = list(
+        dict.fromkeys(str(item["file_version_id"]) for item in selected_memberships)
+    )
+    records_by_file = _load_cached_policy_records(connection, selected_file_ids)
 
     online_records: list[dict[str, Any]] = []
+    membership_meta: dict[str, dict[str, Any]] = {
+        str(item["file_version_id"]): item for item in selected_memberships
+    }
     for membership in selected_memberships:
-        file_record = file_cache.get(str(membership["file_version_id"]))
-        if file_record is not None:
-            online_records.extend(policy_records_from_file_payload(file_record))
+        file_version_id = str(membership["file_version_id"])
+        base_records = records_by_file.get(file_version_id)
+        if base_records is None:
+            continue
+        meta = membership_meta[file_version_id]
+        for base_record in base_records:
+            # query-specific metadata 必须放在浅拷贝上，避免污染跨 task LRU。
+            record = dict(base_record)
+            record["_file_candidate_sources"] = list(
+                meta.get("candidate_file_sources") or []
+            )
+            record["_grep_hit_lines"] = list(meta.get("content_hit_lines") or [])
+            record["_grep_matched_terms"] = list(
+                meta.get("content_matched_terms") or []
+            )
+            online_records.append(record)
+    if profile is not None:
+        profile["universe_records"] = profile.get("universe_records", 0.0) + (
+            time.perf_counter() - stage_started
+        )
+
+    stage_started = time.perf_counter()
     if len(online_records) > ONLINE_UNIT_UNIVERSE_CAP:
         query_terms = set(_retrieval_terms(question))
 
         def universe_key(record: dict[str, Any]) -> tuple[Any, ...]:
+            hit_lines = [int(line) for line in record.get("_grep_hit_lines") or []]
+            start_line = int(record.get("start_line") or 0)
+            end_line = int(record.get("end_line") or start_line)
+            direct_hit = any(start_line <= line <= end_line for line in hit_lines)
+            if hit_lines:
+                distance = min(
+                    0
+                    if start_line <= line <= end_line
+                    else min(abs(line - start_line), abs(line - end_line))
+                    for line in hit_lines
+                )
+            else:
+                distance = 2**31 - 1
+            sources = set(map(str, record.get("_file_candidate_sources") or []))
             searchable = " ".join(
                 [
                     str(record.get("path") or ""),
@@ -7451,16 +8231,31 @@ def _load_policy_evidence_universe(
             digest = hashlib.sha256(
                 f"{question}\0{record['evidence_id']}".encode("utf-8")
             ).hexdigest()
-            return (-overlap, digest, str(record["evidence_id"]))
+            return (
+                -int(direct_hit),
+                -int(bool({"content_fts_file", "git_grep_content"} & sources)),
+                distance,
+                -overlap,
+                -int("path_name_file" in sources),
+                digest,
+                str(record["evidence_id"]),
+            )
 
         online_records = sorted(online_records, key=universe_key)[
             :ONLINE_UNIT_UNIVERSE_CAP
         ]
+    if profile is not None:
+        profile["universe_trim"] = profile.get("universe_trim", 0.0) + (
+            time.perf_counter() - stage_started
+        )
+
+    stage_started = time.perf_counter()
     online_evidence_ids = [str(record["evidence_id"]) for record in online_records]
     evidence_by_id = {
         str(record["evidence_id"]): record for record in online_records
     }
 
+    # 离线 witness 只用于监督完整性；不计入 online_retrieval_rank。
     missing_witness_ids = sorted(
         set(map(str, witness_evidence_ids)) - set(evidence_by_id)
     )
@@ -7477,48 +8272,34 @@ def _load_policy_evidence_universe(
         ):
             unit_by_id[str(row["evidence_id"])] = json.loads(row["payload_json"])
     missing_file_ids = sorted(
-        {
-            str(unit["file_version_id"])
-            for unit in unit_by_id.values()
-            if str(unit["file_version_id"]) not in file_cache
-        }
+        {str(unit["file_version_id"]) for unit in unit_by_id.values()}
     )
-    if missing_file_ids:
-        for offset in range(0, len(missing_file_ids), 800):
-            chunk = missing_file_ids[offset : offset + 800]
-            placeholders = ",".join("?" for _ in chunk)
-            for row in connection.execute(
-                f"SELECT file_version_id, payload_json FROM file_versions "
-                f"WHERE file_version_id IN ({placeholders})",
-                chunk,
-            ):
-                file_cache[str(row["file_version_id"])] = json.loads(
-                    row["payload_json"]
-                )
-    records_by_file: dict[str, dict[str, dict[str, Any]]] = {}
+    missing_records_by_file = _load_cached_policy_records(
+        connection, missing_file_ids
+    )
+    witness_record_maps: dict[str, dict[str, dict[str, Any]]] = {}
     for evidence_id in missing_witness_ids:
         unit = unit_by_id.get(evidence_id)
         if unit is None:
             continue
         file_version_id = str(unit["file_version_id"])
-        if file_version_id not in records_by_file:
-            file_record = file_cache.get(file_version_id)
-            records_by_file[file_version_id] = (
-                {
-                    str(record["evidence_id"]): record
-                    for record in policy_records_from_file_payload(file_record)
-                }
-                if file_record is not None
-                else {}
-            )
-        record = records_by_file[file_version_id].get(evidence_id)
+        if file_version_id not in witness_record_maps:
+            witness_record_maps[file_version_id] = {
+                str(record["evidence_id"]): record
+                for record in missing_records_by_file.get(file_version_id, [])
+            }
+        record = witness_record_maps[file_version_id].get(evidence_id)
         if record is not None:
-            evidence_by_id[evidence_id] = record
+            evidence_by_id[evidence_id] = dict(record)
     unresolved = sorted(set(map(str, witness_evidence_ids)) - set(evidence_by_id))
     if unresolved:
         raise ValueError(
             f"policy witness 引用无法加载：snapshot={snapshot_id}, "
             f"count={len(unresolved)}, first={unresolved[:3]}"
+        )
+    if profile is not None:
+        profile["universe_witness"] = profile.get("universe_witness", 0.0) + (
+            time.perf_counter() - stage_started
         )
     return evidence_by_id, online_evidence_ids
 
@@ -7630,6 +8411,7 @@ def audit_policy_state(
 def build_policy_state(
     state_path: Path,
     *,
+    repo_cache_root: Path = Path("data/cache/repos"),
     tokenizer: Any | None = None,
     max_new_tasks: int | None = None,
 ) -> dict[str, Any]:
@@ -7637,6 +8419,10 @@ def build_policy_state(
 
     tokenizer = tokenizer or load_frozen_tokenizer()
     connection = open_state_database(state_path)
+    # policy 是可恢复的派生状态；NORMAL 同步在 Windows 上能显著减少频繁 fsync。
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    fts_connection: sqlite3.Connection | None = None
     try:
         teacher_phase = connection.execute(
             "SELECT input_fingerprint, completed_at, output_row_count FROM build_phases "
@@ -7652,31 +8438,69 @@ def build_policy_state(
             stable_json_dumps(
                 {
                     "teacher_checkpoint": teacher_phase["input_fingerprint"],
+                    "retriever_version": RETRIEVER_VERSION,
                     "retrieval_channels": RETRIEVAL_CHANNELS,
                     "rrf_k": RRF_K,
+                    "channel_depth": CHANNEL_DEPTH,
+                    "channel_head_reserve": CHANNEL_HEAD_RESERVE,
                     "online_single_cap": FINAL_DEPTH,
+                    "path_file_cap": PATH_FILE_CAP,
+                    "content_file_cap": CONTENT_FILE_CAP,
                     "online_file_cap": ONLINE_FILE_CAP,
                     "online_unit_universe_cap": ONLINE_UNIT_UNIVERSE_CAP,
+                    "policy_file_fts_version": POLICY_FILE_FTS_VERSION,
+                    "policy_file_fts_storage": "sidecar",
+                    "frozen_supervision_reuse": True,
+                    "fts_query_term_cap": FTS_QUERY_TERM_CAP,
+                    "fts_snapshot_filter": "repo_rank_stream_python_membership_v2",
+                    "policy_record_features": "lazy_v1",
+                    "q_only_channel_policy": "task_static_filter_per_state_v1",
+                    "render_token_count_reuse": "accepted_body_exact_count_v1",
+                    "fts_snapshot_filter": "python_membership_postfilter_rank_stream",
+                    "policy_commit_task_interval": POLICY_COMMIT_TASK_INTERVAL,
+                    "policy_file_record_cache": "lru-v1-derived-records",
+                    "policy_file_record_cache_max": POLICY_FILE_RECORD_CACHE_MAX,
                     "model_max_length": MODEL_MAX_LENGTH,
                 }
             ).encode("utf-8")
         ).hexdigest()
         phase = connection.execute(
-            "SELECT completed_at FROM build_phases WHERE phase_name='policy'"
+            "SELECT phase_version, input_fingerprint, completed_at "
+            "FROM build_phases WHERE phase_name='policy'"
         ).fetchone()
-        if phase is not None and phase["completed_at"] is not None:
+        compatible_phase = bool(
+            phase is not None
+            and str(phase["phase_version"]) == POLICY_PHASE_VERSION
+            and str(phase["input_fingerprint"]) == phase_fingerprint
+        )
+        if compatible_phase and phase["completed_at"] is not None:
             connection.close()
             connection = None
             return audit_policy_state(state_path)
-        if phase is None:
+        if not compatible_phase:
+            # 输入指纹或策略版本变化时，只清空 policy 及下游阶段。
+            # corpus/supervision/teacher 均作为冻结输入，不回写。
+            old_state_count = int(connection.execute("SELECT COUNT(*) FROM policy_states").fetchone()[0])
+            old_action_count = int(connection.execute("SELECT COUNT(*) FROM candidate_actions").fetchone()[0])
+            print(
+                f"V2.6 inplace invalidation: replacing old policy "
+                f"states={old_state_count}, actions={old_action_count}; "
+                "frozen corpus/supervision/teacher are preserved",
+                file=sys.stderr,
+                flush=True,
+            )
             connection.execute("DELETE FROM candidate_actions")
             connection.execute("DELETE FROM policy_states")
+            connection.execute(
+                "DELETE FROM build_phases WHERE phase_name IN "
+                "('policy', 'write', 'audit', 'publish')"
+            )
             connection.execute(
                 "INSERT INTO build_phases "
                 "(phase_name, phase_version, input_fingerprint, started_at, "
                 "processed_count, output_row_count, resumable) "
-                "VALUES ('policy', '1.0.0', ?, datetime('now'), 0, 0, 1)",
-                (phase_fingerprint,),
+                "VALUES ('policy', ?, ?, datetime('now'), 0, 0, 1)",
+                (POLICY_PHASE_VERSION, phase_fingerprint),
             )
             connection.commit()
 
@@ -7691,6 +8515,11 @@ def build_policy_state(
             payload = json.loads(row["payload_json"])
             teacher_by_task.setdefault(str(payload["task_id"]), []).append(payload)
 
+        fts_connection, fts_report = open_policy_file_fts_sidecar(
+            state_path,
+            index_path=POLICY_FTS_PATH,
+        )
+
         rows = connection.execute(
             "SELECT c.task_id, c.snapshot_id, c.payload_json AS task_json, "
             "s.payload_json AS supervision_json FROM canonical_tasks c "
@@ -7701,14 +8530,24 @@ def build_policy_state(
         total_tasks = int(connection.execute("SELECT COUNT(*) FROM supervision").fetchone()[0])
         existing_tasks = total_tasks - len(rows)
         rows_to_process = rows if max_new_tasks is None else rows[:max_new_tasks]
+
+        # 只在开始时读取一次 action 总数；后续直接累加本批插入数量。
+        action_count = int(
+            connection.execute("SELECT COUNT(*) FROM candidate_actions").fetchone()[0]
+        )
+        policy_started_at = time.perf_counter()
+        profile_universe = 0.0
+        profile_structure = 0.0
+        profile_states = 0.0
+        profile_write = 0.0
+        detail_profile: dict[str, float] = {}
+
         for local_index, row in enumerate(rows_to_process, 1):
             task_id = str(row["task_id"])
             task_payload = json.loads(row["task_json"])
-            supervision = merge_selected_teacher_supervision(
-                task_id,
-                json.loads(row["supervision_json"]),
-                teacher_by_task.get(task_id, []),
-            )
+            # V2.6 原地模式把 V1 最终 supervision 当作冻结事实；
+            # 不再次合并 teacher，也不回写 obligations/witness_groups/supervision。
+            supervision = json.loads(row["supervision_json"])
             task_input = task_payload.get("input") or {}
             question = "\n".join(
                 [
@@ -7728,13 +8567,23 @@ def build_policy_state(
                     for evidence_id in group.get("evidence_ids") or []
                 }
             )
+            stage_started = time.perf_counter()
             evidence_by_id, online_evidence_ids = _load_policy_evidence_universe(
                 connection,
                 snapshot_id=str(row["snapshot_id"]),
                 question=question,
                 witness_evidence_ids=witness_ids,
+                repo_cache_index=None,
+                fts_connection=fts_connection,
+                profile=detail_profile,
             )
+            profile_universe += time.perf_counter() - stage_started
+
+            stage_started = time.perf_counter()
             structural_edges = build_policy_structural_edges(evidence_by_id)
+            profile_structure += time.perf_counter() - stage_started
+
+            stage_started = time.perf_counter()
             states = build_task_policy_states(
                 task_id=task_id,
                 question=question,
@@ -7745,7 +8594,11 @@ def build_policy_state(
                 tokenizer=tokenizer,
                 online_single_cap=FINAL_DEPTH,
                 model_max_length=MODEL_MAX_LENGTH,
+                profile=detail_profile,
             )
+            profile_states += time.perf_counter() - stage_started
+
+            stage_started = time.perf_counter()
             state_rows, action_rows = flatten_policy_state_records(task_id, states)
             connection.executemany(
                 "INSERT INTO policy_states VALUES (?, ?, ?)",
@@ -7769,37 +8622,21 @@ def build_policy_state(
                     for item in action_rows
                 ],
             )
-            for obligation in supervision.get("obligations") or []:
-                obligation_id = str(obligation["obligation_id"])
-                connection.execute(
-                    "INSERT OR REPLACE INTO obligations VALUES (?, ?, ?)",
-                    (obligation_id, task_id, stable_json_dumps(obligation)),
-                )
-                connection.execute(
-                    "DELETE FROM witness_groups WHERE obligation_id=?",
-                    (obligation_id,),
-                )
-                connection.executemany(
-                    "INSERT INTO witness_groups VALUES (?, ?, ?)",
-                    [
-                        (
-                            str(group["group_id"]),
-                            obligation_id,
-                            stable_json_dumps(group),
-                        )
-                        for group in obligation.get("witness_groups") or []
-                    ],
-                )
-            supervision["policy_states"] = []
-            connection.execute(
-                "UPDATE supervision SET payload_json=? WHERE task_id=?",
-                (stable_json_dumps(supervision), task_id),
-            )
+            # 原地 V2.6 只写 policy_states / candidate_actions。
+            action_count += len(action_rows)
+            profile_write += time.perf_counter() - stage_started
             completed_tasks = existing_tasks + local_index
-            if local_index % 10 == 0 or local_index == len(rows_to_process):
-                action_count = int(
-                    connection.execute("SELECT COUNT(*) FROM candidate_actions").fetchone()[0]
-                )
+
+            should_commit = (
+                local_index % POLICY_COMMIT_TASK_INTERVAL == 0
+                or local_index == len(rows_to_process)
+            )
+            should_report = (
+                local_index % POLICY_PROGRESS_TASK_INTERVAL == 0
+                or local_index == len(rows_to_process)
+            )
+
+            if should_commit:
                 connection.execute(
                     "UPDATE build_phases SET processed_count=?, output_row_count=?, "
                     "failed_at=NULL, error_summary=NULL "
@@ -7807,9 +8644,37 @@ def build_policy_state(
                     (completed_tasks, action_count),
                 )
                 connection.commit()
+
+            if should_report:
+                elapsed = max(1e-9, time.perf_counter() - policy_started_at)
+                processed_now = local_index
                 print(
                     f"policy: {completed_tasks}/{total_tasks} tasks, "
-                    f"{action_count} actions",
+                    f"{action_count} actions, "
+                    f"rate={processed_now / elapsed:.2f} task/s, "
+                    f"profile[s]: universe={profile_universe:.1f}, "
+                    f"structure={profile_structure:.1f}, "
+                    f"states={profile_states:.1f}, write={profile_write:.1f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    "policy-detail[s]: "
+                    + ", ".join(
+                        f"{key}={detail_profile.get(key, 0.0):.1f}"
+                        for key in (
+                            "universe_membership",
+                            "universe_fts",
+                            "universe_records",
+                            "universe_trim",
+                            "universe_witness",
+                            "states_query_precompute",
+                            "states_retrieval",
+                            "states_label",
+                            "states_render",
+                            "states_finalize",
+                        )
+                    ),
                     file=sys.stderr,
                     flush=True,
                 )
@@ -7838,11 +8703,10 @@ def build_policy_state(
         report = audit_policy_state(state_path, expected_task_count=total_tasks)
         connection = open_state_database(state_path)
         connection.execute(
-            "UPDATE build_phases SET input_fingerprint=?, completed_at=datetime('now'), "
+            "UPDATE build_phases SET completed_at=datetime('now'), "
             "failed_at=NULL, error_summary=NULL, processed_count=?, output_row_count=? "
             "WHERE phase_name='policy'",
             (
-                report["checkpoint_sha256"],
                 report["task_count"],
                 report["action_count"],
             ),
@@ -7861,17 +8725,92 @@ def build_policy_state(
                 connection.commit()
         raise
     finally:
+        if fts_connection is not None:
+            with contextlib.suppress(sqlite3.ProgrammingError):
+                fts_connection.close()
         if connection is not None:
             with contextlib.suppress(sqlite3.ProgrammingError):
                 connection.close()
 
+
+def verify_inplace_state_database(state_path: Path) -> dict[str, Any]:
+    """验证 V1 working SQLite 可原地重建 policy，但不修改任何数据。
+
+    V2.2 明确把 corpus/supervision/teacher 当作冻结输入，只允许后续
+    build_policy_state 修改 policy_states、candidate_actions 以及 policy 下游 phase。
+    """
+
+    state_path = state_path.resolve()
+    if not state_path.is_file():
+        raise FileNotFoundError(f"缺少 working SQLite：{state_path}")
+    connection = sqlite3.connect(state_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        required_tables = {
+            "canonical_tasks",
+            "snapshots",
+            "file_versions",
+            "snapshot_file_memberships",
+            "evidence_units",
+            "supervision",
+            "teacher_cache",
+            "policy_states",
+            "candidate_actions",
+            "build_phases",
+        }
+        actual_tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        missing = sorted(required_tables - actual_tables)
+        if missing:
+            raise ValueError(f"working SQLite 缺少必要表：{missing}")
+
+        checkpoints = {}
+        for phase_name in ("split", "snapshots", "corpus", "supervision", "teacher"):
+            row = connection.execute(
+                "SELECT completed_at, processed_count, output_row_count "
+                "FROM build_phases WHERE phase_name=?",
+                (phase_name,),
+            ).fetchone()
+            if row is None or row["completed_at"] is None:
+                raise ValueError(f"原地 V2.6 需要已完成的 V1 {phase_name} checkpoint。")
+            checkpoints[phase_name] = {
+                "processed_count": int(row["processed_count"]),
+                "output_row_count": int(row["output_row_count"]),
+            }
+        return {
+            "state_path": str(state_path),
+            "mode": "inplace_policy_only",
+            "checkpoints": checkpoints,
+        }
+    finally:
+        connection.close()
+
+
+def apply_v2_release_metadata(record: dict[str, Any]) -> None:
+    """仅修改发布记录副本，不回写 canonical_tasks。"""
+
+    if str((record.get("split_info") or {}).get("split") or "") != "benchmark":
+        return
+    evaluation = record.get("evaluation")
+    if not isinstance(evaluation, dict):
+        return
+    evaluation["targets"] = [
+        "evidence_localization",
+        "evidence_acquisition",
+        "evidence_sufficiency",
+    ]
+    evaluation["execution_required"] = False
 
 def run_cli(
     argv: Sequence[str] | None = None,
     *,
     raw_root: Path = Path("data/raw"),
     repo_cache_root: Path = Path("data/cache/repos"),
-    state_path: Path = Path("data/.build/unified_swe_v1.sqlite3"),
+    state_path: Path = WORKING_STATE_PATH,
     expected_raw_counts: dict[str, int] | None = EXPECTED_RAW_SWEBENCH_COUNTS,
     output: Any = sys.stdout,
 ) -> int:
@@ -7886,10 +8825,38 @@ def run_cli(
         raise ValueError("--clean-state 仅能在正式发布及文件哈希复核完成后使用。")
     if args.workers <= 0:
         raise ValueError("--workers 必须为正整数。")
+    if args.max_policy_tasks is not None and args.max_policy_tasks <= 0:
+        raise ValueError("--max-policy-tasks 必须为正整数。")
 
     target_phase = args.through_phase or BUILD_PHASES[-1]
     source_phase_index = BUILD_PHASES.index("split")
     target_phase_index = BUILD_PHASES.index(target_phase)
+    policy_phase_index_for_guard = BUILD_PHASES.index("policy")
+
+    # 只有真正进入 policy 或其下游阶段时，才要求输入必须是完整冻结的 V1 working DB。
+    # 这样 source/split 等独立契约测试仍可以使用最小临时 SQLite，
+    # 同时生产环境的原地 policy 重建保护不被削弱。
+    if target_phase_index >= policy_phase_index_for_guard:
+        inplace_report = verify_inplace_state_database(state_path)
+        print(
+            "V2.6 inplace mode: reuse frozen V1 SQLite; only policy/downstream phases may change",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            f"V2.6 working state: {inplace_report['state_path']}",
+            file=sys.stderr,
+            flush=True,
+        )
+    if (
+        not args.audit_only
+        and target_phase_index >= policy_phase_index_for_guard
+        and not args.confirm_inplace_policy_rebuild
+    ):
+        raise ValueError(
+            "V2.3 使用 V1 SQLite 原地重建 policy。请显式传入 "
+            "--confirm-inplace-policy-rebuild 确认。"
+        )
     if target_phase_index < source_phase_index:
         raise ValueError("sources、normalize、identity 与 split 是不可拆分的原子来源阶段。")
 
@@ -8072,20 +9039,24 @@ def run_cli(
             ),
         )
     else:
-        policy_report = build_policy_state(state_path)
+        policy_report = build_policy_state(
+            state_path,
+            repo_cache_root=repo_cache_root,
+            max_new_tasks=args.max_policy_tasks,
+        )
     report["policy"] = policy_report
     if target_phase_index == policy_phase_index:
         output.write(stable_json_dumps(report) + "\n")
         return 0
 
-    staging_root = Path("data/unified_swe_dataset_v1.tmp")
-    target_root = Path("data/unified_swe_dataset_v1")
+    staging_root = V2_STAGING_ROOT
+    target_root = V2_RELEASE_ROOT
     write_phase_index = BUILD_PHASES.index("write")
     if args.audit_only:
         if not staging_root.is_dir():
             raise FileNotFoundError(f"缺少待审计写出目录：{staging_root}")
         manifest = json.loads(
-            (staging_root / "manifest.json").read_text(encoding="utf-8")
+            (staging_root / MANIFEST_FILENAME).read_text(encoding="utf-8")
         )
         write_report = {
             "phase": "write",
@@ -8150,11 +9121,11 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(
             globals().get("RELEASE_FILES"),
             (
-                "train.parquet",
-                "validation.parquet",
-                "benchmark.parquet",
-                "repository_corpus.parquet",
-                "manifest.json",
+                "train_v2_6.parquet",
+                "validation_v2_6.parquet",
+                "benchmark_v2_6.parquet",
+                "repository_corpus_v2_6.parquet",
+                "manifest_v2_6.json",
             ),
         )
 
@@ -9828,6 +10799,49 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(fused[0]["best_source_rank"], 1)
         self.assertEqual(fused[0]["online_retrieval_rank"], 1)
 
+    def test_v2_file_shortlist_allows_content_hit_without_path_overlap(self) -> None:
+        memberships = [
+            {"path": "src/network.py", "file_version_id": "fv_network"},
+            {"path": "src/opaque.py", "file_version_id": "fv_opaque"},
+        ]
+        selected = select_online_file_memberships(
+            "refresh stale cache",
+            memberships,
+            content_hits=[
+                {
+                    "path": "src/opaque.py",
+                    "line": 10,
+                    "content": "refresh stale cache",
+                    "matched_terms": ["refresh", "stale", "cache"],
+                }
+            ],
+            cap=2,
+            path_cap=1,
+            content_cap=1,
+        )
+        by_id = {item["file_version_id"]: item for item in selected}
+        self.assertIn("fv_opaque", by_id)
+        self.assertIn(
+            "git_grep_content", by_id["fv_opaque"]["candidate_file_sources"]
+        )
+
+    def test_v2_rrf_preserves_single_channel_head(self) -> None:
+        # 构造很多双通道中等排名候选，确保 bm25 rank-1 不会被纯 RRF 挤出。
+        shared = [f"shared_{index:03d}" for index in range(64)]
+        fused = reciprocal_rank_fusion(
+            {
+                "bm25_content": ["bm25_head", *shared[:63]],
+                "path_name": shared,
+                "symbol": [],
+                "structure": [],
+            },
+            depth=16,
+            rrf_k=64,
+            channel_head_reserve=2,
+        )
+        ids = {item["evidence_id"] for item in fused}
+        self.assertIn("bm25_head", ids)
+
     def test_completion_and_progress_follow_and_or_witness_semantics(self) -> None:
         obligations = [
             {
@@ -10269,18 +11283,42 @@ class PolicyTests(unittest.TestCase):
                 ("ev_1", "fv_1", stable_json_dumps(unit), "function", 8, 1),
             )
             connection.execute(
+                "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?)",
+                (
+                    "snapshot_1",
+                    "owner/repo",
+                    "2" * 40,
+                    "ready",
+                    stable_json_dumps(
+                        {
+                            "snapshot_id": "snapshot_1",
+                            "repo": "owner/repo",
+                            "base_commit": "2" * 40,
+                        }
+                    ),
+                ),
+            )
+            connection.execute(
                 "INSERT INTO snapshot_file_memberships VALUES (?, ?, ?)",
                 ("snapshot_1", "src/cache.py", "fv_1"),
             )
             connection.commit()
+            fts_connection = None
             try:
+                fts_connection, _fts_report = open_policy_file_fts_sidecar(
+                    state_path,
+                    index_path=Path(tmp) / "policy_fts.sqlite3",
+                )
                 evidence, online_ids = _load_policy_evidence_universe(
                     connection,
                     snapshot_id="snapshot_1",
                     question="refresh cache",
                     witness_evidence_ids=["ev_1"],
+                    fts_connection=fts_connection,
                 )
             finally:
+                if fts_connection is not None:
+                    fts_connection.close()
                 connection.close()
         self.assertIn("ev_1", evidence)
         self.assertEqual(online_ids, ["ev_1"])
@@ -10563,10 +11601,10 @@ class PolicyTests(unittest.TestCase):
         files = {
             name: {"file": name, "row_count": count, "size_bytes": 10, "sha256": "a" * 64}
             for name, count in (
-                ("train.parquet", 18_347),
-                ("validation.parquet", 223),
-                ("benchmark.parquet", 2_294),
-                ("repository_corpus.parquet", 1_027_752),
+                ("train_v2_6.parquet", 18_347),
+                ("validation_v2_6.parquet", 223),
+                ("benchmark_v2_6.parquet", 2_294),
+                ("repository_corpus_v2_6.parquet", 1_027_752),
             )
         }
         manifest = build_release_manifest(
@@ -10577,7 +11615,7 @@ class PolicyTests(unittest.TestCase):
             statistics={"supervision_level_counts": {"strong": 100}},
         )
         self.assertEqual(set(manifest["files"]), set(files))
-        self.assertNotIn("manifest.json", manifest["files"])
+        self.assertNotIn(MANIFEST_FILENAME, manifest["files"])
         self.assertEqual(manifest["split_counts"], EXPECTED_SPLIT_COUNTS)
         self.assertEqual(manifest["statistics"]["supervision_level_counts"]["strong"], 100)
 
@@ -10586,10 +11624,10 @@ class PolicyTests(unittest.TestCase):
             root = Path(tmp)
             reports: dict[str, dict[str, Any]] = {}
             for name in (
-                "train.jsonl",
-                "validation.jsonl",
-                "benchmark.jsonl",
-                "repository_corpus.jsonl",
+                "train_v2_6.jsonl",
+                "validation_v2_6.jsonl",
+                "benchmark_v2_6.jsonl",
+                "repository_corpus_v2_6.jsonl",
             ):
                 path = root / name
                 path.write_text("{}\n", encoding="utf-8")
@@ -10605,7 +11643,7 @@ class PolicyTests(unittest.TestCase):
                 "split_counts": {"train": 1, "validation": 1, "benchmark": 1},
                 "audit_status": "pending",
             }
-            (root / "manifest.json").write_text(
+            (root / MANIFEST_FILENAME).write_text(
                 stable_json_dumps(manifest) + "\n", encoding="utf-8"
             )
             audited = audit_staged_dataset(
@@ -10623,13 +11661,13 @@ class PolicyTests(unittest.TestCase):
             staging = root / "dataset.tmp"
             target = root / "dataset"
             staging.mkdir()
-            (staging / "manifest.json").write_text(
+            (staging / MANIFEST_FILENAME).write_text(
                 stable_json_dumps({"audit_status": "passed"}) + "\n",
                 encoding="utf-8",
             )
             published = publish_staged_directory(staging, target)
             self.assertEqual(published, target)
-            self.assertTrue((target / "manifest.json").is_file())
+            self.assertTrue((target / MANIFEST_FILENAME).is_file())
             self.assertFalse(staging.exists())
 
     def test_git_grep_shortlist_reads_only_frozen_commit(self) -> None:

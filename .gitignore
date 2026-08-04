@@ -10,6 +10,13 @@ data/registry/master_instances.jsonl
 data/splits/train.jsonl
 data/raw/swebench/train-00000-of-00001.parquet
 
+# 构建中间状态（含 59.7GB SQLite 状态库、日志、审计产物）
+data/.build/
+
+# 最终发布数据集（parquet 最大 6.97GB，超 GitHub 限制，建议走 Git LFS 或数据平台发布）
+data/unified_swe_dataset_v1/*.parquet
+data/unified_swe_dataset_v2_10/*.parquet
+
 # Python
 __pycache__/
 *.py[cod]
