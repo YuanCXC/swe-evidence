@@ -1,133 +1,1004 @@
 # Evidence Agent
 
-> 面向修复保障度的证据获取：在有限预算下，软件修复系统应该收集哪些修复前仓库证据、哪些证据需要组合使用、哪些证据可以相互替代，以及何时停止继续读取仓库。
+> **Gather, Combine, or Skip：面向软件修复的证据交互感知 RAG、Evidence Policy 与多智能体上下文获取系统**
 
-本项目**不生成补丁、不修改代码、不运行测试**，也不使用真实 patch 成功率作为标签或指标。项目只负责从修复前仓库（`repo + base_commit`）获取证据，并判断证据集合是否在信息层面足以支持后续形成正确修复。仓库中已有的测试代码和测试断言可以作为证据读取，但不能执行。
+Evidence Agent 是一个面向软件工程问题定位与修复上下文获取的研究项目。项目以 **SWE-bench 问题描述 + 修复前（pre-fix）代码仓库** 为输入，通过多通道 RAG、状态感知的仓库结构扩展、统一的 Evidence Policy 模型以及多智能体协同机制，迭代选择最有价值的代码证据，并在达到预定义的修复上下文充分性标准后停止。
+
+本项目当前的核心目标不是直接生成补丁，而是构建一个可靠的 **Evidence Acquisition / Context Acquisition System**，为下游代码修复模型提供可定位、可组合、可解释、可追踪的结构化 Evidence Package。
 
 ---
 
-## 一、研究背景与动机
+## 目录
 
-传统代码检索通常隐含假设：每条证据的价值可以独立相加：
+- [1. 项目目标](#1-项目目标)
+- [2. 项目定位与非目标](#2-项目定位与非目标)
+- [3. 系统总体架构](#3-系统总体架构)
+- [4. 核心研究问题](#4-核心研究问题)
+- [5. 核心模块](#5-核心模块)
+- [6. RAG 与 Retriever](#6-rag-与-retriever)
+- [7. Canonical Structure Retrieval](#7-canonical-structure-retrieval)
+- [8. Evidence Policy 模型](#8-evidence-policy-模型)
+- [9. 多智能体协同](#9-多智能体协同)
+- [10. Unified SWE Dataset V2.10](#10-unified-swe-dataset-v210)
+- [11. 数据 Schema](#11-数据-schema)
+- [12. 监督体系](#12-监督体系)
+- [13. 数据泄漏与安全边界](#13-数据泄漏与安全边界)
+- [14. 当前已验证结果](#14-当前已验证结果)
+- [15. 项目目录建议](#15-项目目录建议)
+- [16. 环境与依赖](#16-环境与依赖)
+- [17. 数据构建与发布](#17-数据构建与发布)
+- [18. 审计与质量门禁](#18-审计与质量门禁)
+- [19. 模型训练阶段](#19-模型训练阶段)
+- [20. Agent Online Rollout](#20-agent-online-rollout)
+- [21. 评估体系](#21-评估体系)
+- [22. 实验与消融](#22-实验与消融)
+- [23. 当前开发状态](#23-当前开发状态)
+- [24. 下一阶段路线图](#24-下一阶段路线图)
+- [25. 版本与复现](#25-版本与复现)
+- [26. 数据来源与许可证](#26-数据来源与许可证)
+- [27. FAQ](#27-faq)
+- [28. 项目事实来源](#28-项目事实来源)
 
-```
-Value(K) = Σ Value(u_i)
-```
+---
 
-但实际修复证据往往存在明显交互：
+# 1. 项目目标
 
-- **互补**：单独看 buggy logic 不足以修复，单独看 caller constraint 也不足以修复，两者一起才能确定正确修改；
-- **替代**：完整函数、局部分支、相关测试断言、函数语义摘要可能表达相同信息，全部读取只会增加冗余；
-- **冗余**：当前证据集合已经覆盖某条候选的信息，继续读取没有新增价值。
+本项目研究：
 
-因此需要显式建模：
+> **在有限预算下，软件修复 Agent 应该读取哪些仓库证据、哪些证据需要组合、哪些证据可以相互替代，以及何时停止继续探索。**
 
-```
-Evidence Value = Individual Value + Complementarity − Substitutability/Redundancy
-```
+输入为：
 
-## 二、三项核心贡献
-
-### 贡献一：Sufficiency-Calibrated Repair Evidence Acquisition
-
-将仓库探索从「位置相关性和覆盖率优化」提升为「成本约束下的证据充分性优化」。定义当前证据状态的充分性价值（修复保障度）：
-
-```
-S(K) = P(C(K)=1 | q, K)
-```
-
-其中 `C(K)=1` 表示证据包已覆盖故障位置、故障机理、预期行为、相关约束和影响边界，且不存在关键缺口。任务目标升级为：
-
-```
-max_π  S(K_T) − λ · Cost(K_T)
-```
-
-### 贡献二：Evidence Sufficiency Value-of-Information Policy
-
-估计当前证据包的充分性价值 `Ŝ(K_t)` 与候选证据的条件边际价值：
-
-```
-Δ(u | K_t) = S(K_t ∪ {u}) − S(K_t)
-Q(u | K_t) = Δ(u | K_t) − λ · Cost(u)
-```
-
-同一证据在不同状态下可以有不同价值。自适应停止由剩余信息价值决定：
-
-```
-max_{u ∈ C_t} Q(u | K_t) ≤ 0   且   Ŝ(K_t) ≥ τ
+```text
+SWE Issue / Problem Statement
++
+Pre-fix Repository Snapshot
 ```
 
-即剩余候选证据对充分性的预期增益已经不足以抵消读取成本。
+系统经过多轮证据获取后输出：
 
-### 贡献三：Complementarity- and Substitutability-Aware Evidence Acquisition
-
-显式建模修复证据之间的互补、替代、冗余和条件依赖关系。定义交互价值：
-
-```
-I(u, v | K) = S(K ∪ {u,v}) − S(K ∪ {u}) − S(K ∪ {v}) + S(K)
-```
-
-- `I > 0`：组合增益大于单项增益之和，支持互补；
-- `I ≈ 0`：贡献基本可加，可能独立或单侧冗余；
-- `I < 0`：存在价值重叠或边际收益递减，支持替代或冗余。
-
-## 三、数据来源
-
-本项目只使用以下来源，SWE-bench 是唯一任务基准：
-
-| 来源 | 角色 | 是否创建新任务 | 对齐要求 |
-|------|------|----------------|----------|
-| SWE-bench | 唯一任务基准、问题、commit、patch 和测试 | 是 | 不适用 |
-| ContextBench | Gold context 和细粒度强证据 | 否 | 必须可靠映射到 SWE-bench `instance_id` |
-| SWE-Explore | 多成功轨迹共识区域、可选区域和读取顺序 | 否 | 必须精确命中 SWE-bench `instance_id` |
-| repository snapshot | 修复前完整仓库语料 | 否 | 必须匹配 SWE-bench `repo + base_commit` |
-
-无法与 SWE-bench 可靠对齐的来源记录不下载、不合并、不发布。
-
-**关键的防泄漏规则**：Gold patch、test patch、ContextBench gold context、SWE-Explore trajectory 等只能作为离线标签，不能暴露给在线检索模型。所有模型可见代码都必须来自修复前 `base_commit` 对应的快照。
-
-## 四、最终发布结构
-
-完整数据集由一条命令生成，最终发布 5 个文件：
-
-```
-data/unified_swe_dataset_v1/
-├── train.parquet              # 18,347 个训练任务
-├── validation.parquet         # 223 个验证任务
-├── benchmark.parquet          # 2,294 个评测任务
-├── repository_corpus.parquet  # 1,027,752 个唯一文件版本 / 25,496,300 个 Evidence Unit
-└── manifest.json              # Schema、来源、哈希、统计和审计元数据
+```text
+Evidence Package
+├── Selected Files
+├── Selected Evidence Units
+├── Relevant Symbols
+├── Structural Relations
+├── Acquisition Trace
+└── Sufficiency / STOP Decision
 ```
 
-当前已发布的实测规模（来自 `manifest.json`）：
+Evidence Package 的目标是支持下游修复模型完成：
 
-| 项目 | 数量 |
-|------|-----:|
-| SWE-bench train | 19,008 |
-| SWE-bench dev | 225 |
-| SWE-bench test | 2,294 |
-| 删除的无证书 train/dev 任务 | 663 |
-| 最终发布 train | 18,347 |
-| 最终发布 validation | 223 |
-| 最终发布 benchmark | 2,294 |
-| 最终发布总任务 | 20,864 |
-| 唯一文件版本 | 1,027,752 |
-| Evidence Unit | 25,496,300 |
-| 仓库快照 | 18,527 |
-| snapshot-file 成员关系 | 32,092,093 |
-| policy state | 42,284 |
-| 候选动作（single+pair+stop） | 2,880,701 |
+- Bug localization；
+- Root-cause analysis；
+- Dependency / state-flow analysis；
+- Behavior constraint understanding；
+- Patch planning。
 
-### 4.1 统一任务 Schema
+更准确地说，本项目希望实现：
 
-三个任务文件（train / validation / benchmark）共用同一个物理 Schema，一行代表一个去重任务：
+> **达到预定义修复上下文充分性标准，并为下游修复模型提供可靠的定位、原因分析与补丁规划上下文。**
+
+项目不声称仅凭 Evidence Agent 就能保证最终代码修复成功。
+
+---
+
+# 2. 项目定位与非目标
+
+## 2.1 当前项目定位
+
+Evidence Agent 是一个融合以下三条技术路线的系统：
+
+1. **RAG / Repository Retrieval**
+2. **Evidence Policy Model Training**
+3. **Multi-Agent / Agentic Evidence Acquisition**
+
+三者的职责不同：
+
+| 模块 | 核心问题 |
+|---|---|
+| RAG | “有哪些证据值得看？” |
+| Evidence Policy | “当前最应该选择哪个证据、哪组证据，还是 STOP？” |
+| Multi-Agent | “如何组织多轮检索、结构探索、决策和停止？” |
+
+---
+
+## 2.2 当前非目标
+
+当前 Evidence Agent **不负责**：
+
+- 生成代码补丁；
+- 自动修改仓库；
+- 运行测试；
+- 根据测试反馈继续修复；
+- 用修复后代码作为在线输入；
+- 保证下游修复一定成功。
+
+因此当前系统边界为：
+
+```text
+Issue + Pre-fix Repository
+          ↓
+Evidence Acquisition
+          ↓
+Structured Evidence Package
+          ↓
+Downstream Repair Model
+```
+
+而不是：
+
+```text
+Issue
+ ↓
+直接自动生成最终 Patch
+```
+
+---
+
+# 3. 系统总体架构
+
+```mermaid
+flowchart TD
+    Q[SWE Issue / Problem Statement] --> PA[Problem Analysis]
+    R[Pre-fix Repository] --> CORPUS[Repository Corpus / Evidence Units]
+
+    PA --> FR[File Retrieval]
+    CORPUS --> FR
+
+    FR --> UR[Evidence Unit Retrieval]
+    CORPUS --> UR
+
+    K[Current Evidence Set K] --> STRUCT[Canonical Structure Expansion]
+    CORPUS --> STRUCT
+
+    UR --> CAND[Candidate Actions]
+    STRUCT --> CAND
+
+    CAND --> POLICY[Cross-Encoder Evidence Policy]
+    Q --> POLICY
+    K --> POLICY
+
+    POLICY --> SINGLE[Single Evidence]
+    POLICY --> PAIR[Pair Evidence]
+    POLICY --> STOP[STOP]
+
+    SINGLE --> UPDATE[Update K]
+    PAIR --> UPDATE
+    UPDATE --> K
+
+    STOP --> PACK[Evidence Package]
+```
+
+在线执行过程可以写成：
+
+```text
+q = issue
+K = ∅
+
+while True:
+    candidates = Retriever(q, K, pre_fix_repo)
+    A* = argmax_A Policy(q, K, A)
+
+    if A* == STOP:
+        break
+
+    K = K ∪ Evidence(A*)
+
+return EvidencePackage(K)
+```
+
+---
+
+# 4. 核心研究问题
+
+项目的研究重点不是普通的静态 `query → document relevance`，而是：
+
+> **Given what I already know, what should I acquire next?**
+
+设：
+
+- `q`：软件问题描述；
+- `K`：当前已经获取的证据集合；
+- `A`：候选动作。
+
+统一策略模型为：
+
+\[
+s_A = f_\theta(q, K, A)
+\]
+
+候选动作包含：
+
+```text
+[u]       单 Evidence
+[u, v]    双 Evidence
+STOP      停止证据获取
+```
+
+因此系统需要同时学习：
+
+- Evidence relevance；
+- Evidence incremental value；
+- Evidence complementarity；
+- Evidence substitutability；
+- Evidence redundancy；
+- STOP / context sufficiency。
+
+---
+
+## 4.1 Value-of-Information 研究视角
+
+项目理论主线可以进一步解释为 Evidence Value-of-Information。
+
+定义当前证据包对下游修复过程的价值：
+
+\[
+V_G(K)
+\]
+
+候选证据 `u` 的条件边际价值：
+
+\[
+\Delta_G(u \mid K)
+=
+V_G(K \cup \{u\}) - V_G(K)
+\]
+
+考虑读取成本后：
+
+\[
+Q_G(u \mid K)
+=
+\Delta_G(u \mid K) - \lambda Cost(u)
+\]
+
+两条证据之间的交互价值可写为：
+
+\[
+I_G(u,v\mid K)
+=
+V_G(K\cup\{u,v\})
+-
+V_G(K\cup\{u\})
+-
+V_G(K\cup\{v\})
++
+V_G(K)
+\]
+
+这一视角用于解释：
+
+```text
+complement
+substitute
+redundant
+independent
+conflict
+```
+
+需要注意：
+
+> **当前 V2.10 已实现的数据与 Policy supervision 主要基于 deterministic supervision、aligned public context、obligation / witness 和 verified teacher labels。完整的 behavior-calibrated `V_G` 实验属于后续研究扩展，不应把尚未实现的行为校准写成当前已经完成的功能。**
+
+---
+
+# 5. 核心模块
+
+整个项目可以拆成七个主要模块。
+
+```text
+1. Repository Corpus / Evidence Unit
+2. RAG / Retriever
+3. Canonical Structure Retrieval
+4. Supervision / Dataset Builder
+5. Evidence Policy Model
+6. Multi-Agent Orchestration
+7. Evaluation / Audit
+```
+
+---
+
+## 5.1 Repository Corpus / Evidence Unit
+
+该模块将完整代码仓库转换成可检索、可排序、可引用的 Evidence Space。
+
+基本层级：
+
+```text
+Repository
+└── File Version
+    └── Evidence Units
+        ├── class
+        ├── function / method
+        ├── code block
+        ├── branch / local region
+        └── other scoreable units
+```
+
+一个 Evidence Unit 至少包含：
+
+```text
+evidence_id
+file_version_id
+path
+unit_type
+symbol
+start_line
+end_line
+content
+parent_evidence_id
+rendered_token_count
+```
+
+Evidence Unit 的作用是避免把完整文件直接塞入 Cross-Encoder，使模型可以在细粒度代码证据上进行动作决策。
+
+---
+
+## 5.2 Supervision / Dataset Builder
+
+原始 SWE 数据并不会直接给出：
+
+```text
+step 0 -> Evidence A
+step 1 -> Evidence B
+step 2 -> STOP
+```
+
+因此数据构建器需要把：
+
+```text
+SWE-bench patch / test patch
+ContextBench aligned context
+SWE-Explore aligned evidence
+deterministic rules
+verified teacher labels
+```
+
+转换成：
+
+```text
+obligations
+witness groups
+evidence labels
+policy states
+candidate actions
+STOP labels
+loss masks
+```
+
+最终形成可训练的序列决策状态。
+
+---
+
+# 6. RAG 与 Retriever
+
+RAG 层的职责不是最终决定“哪个 Evidence 一定正确”，而是提高：
+
+> **Candidate Reachability**
+
+也就是让真正有价值的 Evidence 尽可能进入 Policy Model 的候选池。
+
+---
+
+## 6.1 File Retrieval
+
+V2.10 使用两个文件召回通道：
+
+```text
+problem q
+├── path_name_file
+└── content_fts_file
+```
+
+冻结参数：
+
+| 参数 | V2.10 |
+|---|---:|
+| Path file cap | 32 |
+| Content FTS file cap | 64 |
+| Online file union cap | 96 |
+
+Path Retrieval 适合：
+
+```text
+foo.py
+CacheManager
+parser
+serializer
+```
+
+Content FTS 适合：
+
+```text
+refresh stale cache
+incorrectly handles timeout
+unexpected exception
+wrong output under condition X
+```
+
+两个通道做 union 后再进入 Evidence Unit 层。
+
+---
+
+## 6.2 Evidence Unit Retrieval
+
+当前 Evidence Unit 级通道：
+
+```text
+bm25_content
+path_name
+symbol
+structure
+```
+
+冻结参数：
+
+| 参数 | V2.10 |
+|---|---:|
+| Online unit universe cap | 4096 |
+| Channel depth | 64 |
+| Final depth | 64 |
+| RRF k | 64 |
+| Channel head reserve | 8 |
+| Regular pair cap | 8 |
+
+融合方式：
+
+```text
+channel-head-preserved RRF
+```
+
+Retriever 版本：
+
+```text
+retriever-v2.10-stream-fts-clean-canonical-1hop-head-rrf
+```
+
+---
+
+## 6.3 为什么不只使用 Cross-Encoder
+
+Cross-Encoder 只能对“已经进入候选池”的动作评分。
+
+如果正确 Evidence 根本没有被 Retriever 找到：
+
+```text
+correct Evidence ∉ candidate set
+```
+
+那么再强的 Cross-Encoder 也无法选择它。
+
+因此系统分成两个不同问题：
+
+```text
+Retriever:
+正确证据是否可达？
+
+Policy:
+候选可达后，当前应该选择哪个？
+```
+
+---
+
+# 7. Canonical Structure Retrieval
+
+Structure Retrieval 是本项目从普通静态 RAG 走向 Agentic RAG 的关键。
+
+普通 RAG：
+
+```text
+q
+↓
+Retriever
+↓
+Documents
+```
+
+本项目还允许：
+
+```text
+Current Evidence K
+        ↓
+Canonical Pre-fix Repository Structure
+        ↓
+parent / child / previous / next
+        ↓
+New Evidence
+```
+
+即：
+
+\[
+R_{\text{structure}}(K, \mathcal{G}_{repo})
+\]
+
+---
+
+## 7.1 V2.10 的 canonical structure 约束
+
+V2.10 明确要求：
+
+```text
+Current K
++
+Pre-fix Repository
+```
+
+是 structure expansion 唯一允许的信息来源。
+
+禁止：
+
+```text
+offline witness
+gold patch
+test patch
+gold context marker
+teacher answer
+```
+
+参与 online graph。
+
+---
+
+## 7.2 真实 adjacency
+
+假设完整文件中的 Evidence Unit 顺序为：
+
+```text
+A - B - C - D - E
+```
+
+即使当前 lexical candidate subset 只有：
+
+```text
+A, E
+```
+
+也绝不能构造：
+
+```text
+A <-> E
+```
+
+V2.10 的 adjacency 基于完整 `file_version` 中真实 scoreable Evidence Unit 的顺序。
+
+---
+
+## 7.3 1-hop Expansion
+
+当前默认使用 canonical 1-hop：
+
+```text
+K Evidence
+├── parent
+├── child
+├── previous scoreable unit
+└── next scoreable unit
+```
+
+结构扩张允许将 lexical 4096 base universe 之外的真实邻居加入当前 state-visible candidates。
+
+这意味着：
+
+```text
+q-only lexical retrieval
+        ↓
+base online universe
+        +
+current K
+        ↓
+canonical 1-hop
+        ↓
+state-visible universe
+```
+
+而不是要求结构邻居先被 lexical Retriever 找到。
+
+---
+
+# 8. Evidence Policy 模型
+
+项目最终只训练 **一个** Evidence Policy 模型。
+
+核心函数：
+
+\[
+s_A = f_\theta(q,K,A)
+\]
+
+其中：
+
+```text
+q = problem statement / issue
+K = current evidence set
+A = [u] | [u,v] | STOP
+```
+
+---
+
+## 8.1 统一动作空间
+
+同一个 Cross-Encoder 同时评分：
+
+```text
+score(q, K, [u])
+score(q, K, [u, v])
+score(q, K, STOP)
+```
+
+运行时执行：
+
+```text
+A* = argmax_A score(q, K, A)
+```
+
+如果：
+
+```text
+A* = [u]
+```
+
+则：
+
+```text
+K := K ∪ {u}
+```
+
+如果：
+
+```text
+A* = [u, v]
+```
+
+则：
+
+```text
+K := K ∪ {u, v}
+```
+
+如果：
+
+```text
+A* = STOP
+```
+
+则结束 Evidence Acquisition。
+
+---
+
+## 8.2 一个模型，不是多个模型
+
+“只训练一个模型”意味着：
+
+- Single、Pair、STOP 共用 Backbone；
+- 共用统一动作排序头；
+- 不训练独立 STOP classifier；
+- 不训练独立 Pair selector；
+- Retriever 是 deterministic / non-trainable；
+- Teacher 只参与离线 supervision；
+- 多智能体中的不同 Agent 角色不等于多个训练模型。
+
+---
+
+## 8.3 Backbone
+
+当前项目 **尚未固定最终 Policy Backbone**。
+
+推荐实现时使用可配置接口，例如：
+
+```python
+AutoTokenizer
+AutoModelForSequenceClassification
+```
+
+或自定义 Cross-Encoder ranking head。
+
+V2.10 manifest 中记录的：
+
+```text
+BAAI/bge-reranker-v2-m3
+revision:
+953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+```
+
+当前主要是 **冻结的 tokenizer / token accounting contract**。
+
+它不应被 README 或论文误写为“最终 Policy Backbone 已经确定为 bge-reranker-v2-m3”。
+
+---
+
+## 8.4 输入长度契约
+
+冻结参数：
+
+```text
+model_max_length = 4096
+question_max_tokens = 2048
+```
+
+候选 Evidence Unit 正文不能被 DataLoader 静默截断。
+
+如果完整：
+
+```text
+(q, K, A)
+```
+
+仍超过 4096：
+
+```text
+scoreable = false
+action_loss_mask = false
+```
+
+该动作保留用于审计，但不进入训练 loss。
+
+---
+
+# 9. 多智能体协同
+
+多智能体层的目的不是让多个大模型重复聊天，而是把不同 Evidence Acquisition 职责解耦。
+
+目标架构可以划分为：
+
+```text
+Problem Analysis Agent
+        ↓
+Retrieval Agent
+        ↓
+Structure Exploration Agent
+        ↓
+Evidence Policy Agent
+        ↓
+Sufficiency / Coordinator Agent
+```
+
+---
+
+## 9.1 Problem Analysis Agent
+
+负责从 Issue 中抽取：
+
+- Error behavior；
+- Related subsystem；
+- Potential files；
+- Symbols；
+- Constraints；
+- Retrieval intent。
+
+输出标准化 query 或 retrieval hints。
+
+---
+
+## 9.2 Retrieval Agent
+
+负责调用 deterministic RAG：
+
+```text
+Path Retrieval
+Content FTS
+BM25
+Symbol Retrieval
+RRF
+```
+
+输出当前 lexical candidates。
+
+---
+
+## 9.3 Structure Exploration Agent
+
+基于当前 `K` 调用 canonical repository structure：
+
+```text
+parent
+child
+previous
+next
+```
+
+扩展当前 state 的候选 Evidence。
+
+---
+
+## 9.4 Evidence Policy Agent
+
+使用训练后的唯一 Cross-Encoder：
+
+```text
+(q, K, A1)
+(q, K, A2)
+...
+(q, K, STOP)
+```
+
+选择最高效用动作。
+
+---
+
+## 9.5 Sufficiency / Coordinator Agent
+
+负责：
+
+- 管理 Evidence budget；
+- 管理最大 acquisition steps；
+- 维护 K；
+- 检查 STOP；
+- 防止重复 Evidence；
+- 记录 acquisition trace；
+- 生成最终 Evidence Package。
+
+正常 STOP 仍由统一 Policy action 竞争产生。
+
+Coordinator 的硬预算只作为安全边界，而不是代替模型 STOP。
+
+---
+
+# 10. Unified SWE Dataset V2.10
+
+当前冻结数据版本：
+
+```text
+dataset_name    = unified_swe_dataset_v2_10
+dataset_version = 2.10.0
+schema_version  = 1.0
+script_version  = 0.2.10
+audit_status    = passed
+format          = parquet
+```
+
+发布目录：
+
+```text
+data/unified_swe_dataset_v2_10/
+├── train_v2_10.parquet
+├── validation_v2_10.parquet
+├── benchmark_v2_10.parquet
+├── repository_corpus_v2_10.parquet
+└── manifest_v2_10.json
+```
+
+---
+
+## 10.1 Split
+
+| Split | Tasks |
+|---|---:|
+| Train | 18,347 |
+| Validation | 223 |
+| Benchmark | 2,294 |
+| **Total** | **20,864** |
+
+---
+
+## 10.2 Repository Corpus
+
+| 指标 | 数量 |
+|---|---:|
+| File Versions | 1,027,752 |
+| Evidence Units | 25,496,300 |
+| Snapshots | 18,527 |
+| Snapshot-file memberships | 32,092,093 |
+
+完整代码正文只在 `repository_corpus_v2_10.parquet` 中存一次。
+
+任务文件通过稳定 `evidence_id` 引用 corpus。
+
+---
+
+## 10.3 Policy States
+
+| State Type | Count |
+|---|---:|
+| Initial | 20,864 |
+| Decision Boundary | 556 |
+| Complete | 20,864 |
+| **Total** | **42,284** |
+
+状态含义：
+
+### Initial
+
+```text
+K = ∅
+```
+
+用于学习 first-hop Evidence acquisition。
+
+### Decision Boundary
+
+```text
+K != ∅
+尚未达到 complete
+```
+
+用于学习：
+
+- state-conditioned evidence value；
+- evidence complementarity；
+- structure expansion；
+- 下一步 acquisition。
+
+### Complete
+
+当前 supervision 定义下已经满足必要 Evidence obligations。
+
+主要用于学习 STOP。
+
+---
+
+## 10.4 Candidate Actions
+
+V2.10 Policy 总动作数：
+
+```text
+3,094,993
+```
+
+其中：
+
+| Action | Count |
+|---|---:|
+| Single | 2,721,201 |
+| Pair | 331,508 |
+| STOP | 42,284 |
+
+---
+
+## 10.5 Supervision Level
+
+| Level | Tasks |
+|---|---:|
+| Strong | 1,921 |
+| Support | 18,943 |
+
+分 Split：
+
+| Split | Strong | Support |
+|---|---:|---:|
+| Train | 1,436 | 16,911 |
+| Validation | 172 | 51 |
+| Benchmark | 313 | 1,981 |
+
+---
+
+## 10.6 Teacher Supervision
+
+当前 release 中 teacher pipeline 已完成。
+
+选择的 verified teacher packets：
+
+```text
+Train      1,400
+Validation   400
+Total      1,800
+```
+
+Teacher 的角色是：
+
+> 离线解决 deterministic rules 和公共 Gold 无法稳定解决的歧义监督。
+
+Teacher：
+
+- 不属于最终部署模型；
+- 不进入 online Agent 输入；
+- 不允许作为 benchmark teacher-only Gold 的替代品。
+
+---
+
+# 11. 数据 Schema
+
+三个任务文件使用统一物理 Schema。
+
+顶层结构：
 
 ```json
 {
   "schema_version": "1.0",
-  "task_id": "task_django_12345",
-  "task_group_id": "group_django_issue_12345",
-  "snapshot_id": "snapshot_django_abc123",
+  "task_id": "...",
+  "task_group_id": "...",
+  "snapshot_id": "...",
   "input": {},
   "provenance": [],
   "supervision": {},
@@ -138,344 +1009,1686 @@ data/unified_swe_dataset_v1/
 }
 ```
 
-**模型输入与离线监督严格分区**：
+---
 
-- `input`：模型和 Retriever 可以访问的唯一任务输入区，包含 `repo`、`base_commit`、`problem_statement`、`retrieval_scope` 等。禁止写入 Gold patch、test patch、Gold 文件/函数/span、obligation、witness、成功轨迹。
-- `supervision`：保存离线训练标签和评分答案，包含 `evidence_labels`、`obligations`、`witness_groups`、`policy_states`、`gold_patch`、`test_patch` 等，不属于模型输入。
+## 11.1 `input`
 
-### 4.2 义务、Witness Group 与评分
+这是 Model / Retriever 唯一允许访问的任务级输入区。
 
-每个任务只生成确实适用且能够获得证据支持的义务。固定 7 类义务：
+包含：
 
-| 类型 | 含义 |
-|------|------|
-| `fault_location` | 故障发生的位置 |
-| `fault_logic` | 错误机制或错误逻辑 |
-| `dependency_context` | 调用、继承、导入等依赖约束 |
-| `state_flow` | 状态、参数或数据如何流动 |
-| `behavior_constraint` | 问题要求的正确行为 |
-| `repair_scope` | 修复可能影响的范围 |
-| `validation_constraint` | 测试、边界条件和回归约束 |
-
-采用「方案 C」的语义：义务是「必须弄清楚的问题」，不是某个固定文件或 span。一个义务可以有多个 witness group，同一 group 内按 AND 解释，不同 group 间按 OR 解释。`A + B` 形成互补关系，`[A, B]` 与 `C` 形成可替代路径。
-
-评分采用两个原始分量：
-
-- **完成度** `C(K)`：已完成的 mandatory obligations 数量 / mandatory obligations 总数；
-- **进度** `P(K)`：所有 applicable obligations 的 witness 进度平均值（避免把互补证据组的第一个证据错误标成零价值）。
-
-动作增益：
-
-```
-completion_gain = C(K ∪ A) − C(K)
-progress_gain   = P(K ∪ A) − P(K)
-```
-
-### 4.3 状态与候选动作
-
-每个任务自适应生成 2～3 个 `policy_state`：
-
-| `state_type` | 构造方式 | 训练目的 |
-|--------------|----------|----------|
-| `initial` | 固定 `K = empty` | 从零开始选择第一批证据；STOP 为负例 |
-| `decision_boundary` | 最接近充分但仍不充分的 Gold 状态 | 学习继续补证，避免提前 STOP |
-| `complete` | `K` 固定为规范化最小充分证书 | 学习证据充分后选择 STOP，拒绝冗余动作 |
-
-动作空间包含三种：
-
-- **单证据动作** `[u]`：获取一条 Evidence Unit；
-- **双证据动作** `[u, v]`：同时获取两条证据，用于学习互补/替代/冗余关系；
-- **STOP**：与证据动作竞争的特殊动作，由同一个 Cross-Encoder 统一评分。
-
-**在线候选与离线标签候选分离**：
-
-- 在线候选只允许使用真实运行时可见的信息（BM25、路径、符号、结构扩展），固定四个等权 RRF 通道：`bm25_content`、`path_name`、`symbol`、`structure`，通道深度 64，RRF 常数 64，融合保留 64。
-- 离线标签候选用于确定训练真值和补足正例，可以使用 patch 映射、ContextBench、SWE-Explore、witness group、规则验证教师标签。
-
-### 4.4 双证据交互与多标签关系
-
-双证据动作显式记录相对于当前状态 `K` 的二阶交互量：
-
-```
-I_C(u, v | K) = C(K ∪ {u,v}) − C(K ∪ {u}) − C(K ∪ {v}) + C(K)
-I_P(u, v | K) = P(K ∪ {u,v}) − P(K ∪ {u}) − P(K ∪ {v}) + P(K)
-```
-
-关系标签按 obligation 展开，支持 5 个类别（多标签，可同时为真）：
-
-| 关系 | 判定原则 |
-|------|----------|
-| `complement` | 位于同一 AND group，任一单证据无法完成该义务 |
-| `substitute` | 位于同一义务的不同 group，任一 group 都能独立满足义务 |
-| `redundant` | 内容相同、区间包含、高度重叠或相同语义的重复表示 |
-| `independent` | 分别推进不同义务，且不存在明显交互 |
-| `conflict` | 版本、行为或约束指向矛盾结论 |
-
-`unknown` 不作为第 6 个输出类别，只通过目标值 null 和损失掩码表达。
-
-### 4.5 严格 STOP
-
-STOP 使用已确认的严格规则：
-
-```
-全部 mandatory obligations 已完成 -> STOP 可接受
-任一 mandatory obligation 未完成   -> STOP 不可接受
-义务定义或覆盖关系不可靠            -> STOP unknown
-```
-
-正常终止不设置额外分数阈值或 STOP 二分类器，固定由统一动作排序头的 argmax 决定。为防止 STOP 校准失败导致无界取证，设置两项 train-only 数据驱动的硬预算：
-
-```
-evidence_token_budget     = 32768   # 累计获取 Evidence Unit 的渲染成本上限
-selected_evidence_unit_cap = 64      # 唯一 Evidence Unit 数量上限
-```
-
-### 4.6 repository_corpus.parquet
-
-每行表示一个**唯一文件版本**，唯一键为 `repo + path + blob_oid`：同一仓库、同一路径、同一内容只保存一次，多个代码快照通过 `snapshot_ids` 共享相同文件版本，文件正文只保存一次。
-
-```
-file_version_id    全局唯一文件版本 ID
-repo / path / blob_oid / content_sha256
-snapshot_ids       使用此文件版本的全部快照 ID
-evidence_units     文件内的可检索结构（file / class / function / method / code_block / doc_section）
-imports            文件的静态依赖声明
-extraction         解析器、版本和状态
-```
-
-Evidence Unit 的正文通过行号范围恢复：
-
-```python
-unit_content = file_content_lines[start_line - 1:end_line]
-```
-
-任何任务只能访问 `snapshot_ids` 包含自身 `snapshot_id`、且 `attributes.searchable=true` 的文件版本和 Evidence Unit。
-
-## 五、受约束教师标注
-
-教师标注只补足语义缺口（义务角色、pair 关系），不替代全量规则监督。
-
-- **采用范围**：仅在 ContextBench / SWE-Explore 证据无法确定语义角色、缺少完整义务图、pair 缺少最小 witness group 等情况下调用，不对全部任务做无差别教师调用。
-- **教师只输出**：从固定 7 种义务类型中选择、引用真实存在的 `evidence_id`、使用 AND group 和 group 间 OR、输出 `unknown`、给出置信度和依据。
-- **教师不得**：创建新代码正文、直接给出 `C`/`P`/动作增益/STOP、直接输出关系对象、把未提供的仓库文件加入 witness、覆盖确定性冲突标签。
-- **单次标注与程序验证**：每个教师包只进行 1 次语义标注，不做多次采样或多数投票；通过全部程序约束的结果记录为 `teacher_verified`，未通过的不得进入训练监督。
-- **最终冻结规模**：1,800 个有效教师标签（train 1,400 + validation 400），教师模型为 `deepseek-v4-flash`，Prompt 版本 `unified-swe-teacher-v4`。benchmark 禁止 teacher-only 标签作为 Gold。
-
-## 六、唯一训练模型：Cross-Encoder Evidence Policy Ranker
-
-最终只训练**一个**面向软件仓库问题定位的、状态条件化且支持证据组合的 Cross-Encoder Evidence Policy Ranker。
-
-核心函数：
-
-```
-s_A = f_θ(q, K, A)
-```
-
-- `q`：SWE-bench 问题描述；
-- `K`：当前已获取的有界证据集合；
-- `A`：单证据 `[u]`、双证据 `[u, v]` 或 `STOP`；
-- `s_A`：动作效用排序分数，分数越高表示当前越值得执行。
-
-「只训练一个模型」的含义：只产生一套参数和一个最终检查点；单证据、双证据和 STOP 共用同一个 Backbone 与动作排序头；不训练独立 Retriever、pair 选择器、STOP 分类器或另一个 Evidence Policy；教师模型只参与离线标注，不属于训练产物。
-
-### 6.1 输入渲染
-
-```
-[QUESTION]
+```text
+repo
+base_commit
+language
+issue_id
 problem_statement
-
-[CURRENT EVIDENCE]
-K 中按固定顺序渲染的有界 Evidence Unit
-
-[CANDIDATE ACTION]
-单个 Evidence Unit、两个 Evidence Unit，或 [STOP]
+hints
+environment
+retrieval_scope
 ```
 
-冻结长度约束（基于真实数据审计确定）：
+当前 release 的任务语言统一为：
 
-```
-model_max_length          = 4096   # 完整 (q, K, A) 输入硬上限
-question_max_tokens       = 2048   # 问题视图上限
-scoreable_unit_max_tokens = 1024    # 单个候选 Evidence Unit 渲染上限
+```text
+python
 ```
 
-Tokenizer 冻结为 `BAAI/bge-reranker-v2-m3`（revision `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`）。渲染器先保留候选动作 `A` 的完整正文和 `K` 的全部证据元数据，再把剩余预算动态分配给 `K` 的正文。DataLoader 必须令 Tokenizer 的自动截断失效，任何依赖 `truncation=true` 静默修剪候选正文的实现都属于发布阻断错误。
+禁止进入 `input`：
 
-### 6.2 训练方式
-
-训练样本按状态组织，主损失采用支持多正例的 listwise ranking loss：
-
-```
-L_total = L_rank + λ_relation · L_relation
-```
-
-- `L_rank`：只读取 `ranking_loss_mask=true` 的状态和其中 `action_loss_mask=true` 的动作；
-- `L_relation`：带掩码的多标签 Binary Cross-Entropy，只在拥有可靠义务级关系标签的双证据动作及 `relation_loss_masks.<class>=true` 的类别上计算。
-
-训练按同一个检查点逐步加入更难样本，不在各阶段分别训练不同模型：
-
-```
-单证据初始状态预热
--> 状态感知单证据排序
--> 高置信度双证据动作
--> STOP 与关系联合校准
+```text
+gold_patch
+test_patch
+gold file
+gold span
+obligation
+witness
+teacher explanation
+successful trajectory label
 ```
 
-## 七、快速开始
+---
 
-### 7.1 环境要求
+## 11.2 `provenance`
 
-- Python 3.11+
-- Git（用于 `git cat-file`、`git ls-tree` 等 bare 仓库快照操作）
-- 教师标注阶段需要 `TEACHER_API_KEY` 或 `DEEPSEEK_API_KEY`（仅 teacher 阶段需要，确定性阶段无需）
+记录任务对应的上游来源。
 
-### 7.2 构建数据集
+例如：
 
-唯一构建入口为 [scripts/build_unified_dataset.py](file:///e:/Code_Personal/Subject/evidence-agent/scripts/build_unified_dataset.py)，不使用外部配置文件。
-
-```powershell
-# 实验版（JSONL，逐行可审计）
-python scripts/build_unified_dataset.py --format jsonl
-
-# 正式发布版（Parquet，通过硬门禁后原子发布）
-python scripts/build_unified_dataset.py --format parquet --release
+```text
+dataset
+subset
+source_id
+version
+revision
+license
+trust_tier
+raw_record_sha256
 ```
 
-常用参数：
+同一个 SWE task 与 ContextBench / SWE-Explore 对齐后仍然只占一个任务行。
 
-| 参数 | 说明 |
-|------|------|
-| `--format {jsonl,parquet}` | 输出格式，默认 `jsonl` |
-| `--release` | 通过硬门禁后原子发布正式版 |
-| `--clean-state` | 复核正式文件哈希后删除 SQLite 状态 |
-| `--audit-only` | 只运行已完成阶段的审计，不发布 |
-| `--through-phase PHASE` | 执行到指定内部阶段后停止 |
-| `--self-test` | 运行脚本内置契约与单元测试 |
-| `--workers N` | corpus 物化进程数（Windows 无窗口长跑默认 1） |
-| `-v / -vv` | 增加日志详细度 |
+外部来源增加的是：
 
-### 7.3 构建阶段
-
-单次命令按以下内部阶段执行（支持断点续跑）：
-
-```
-sources -> normalize -> identity -> split -> snapshots -> corpus
--> supervision -> teacher -> policy -> write -> audit -> publish
+```text
+provenance
++
+supervision overlay
 ```
 
-- **唯一构建状态库**：`data/.build/unified_swe_v1.sqlite3`，承担规范化、关联、断点和审计状态，不属于最终发布数据。
-- **临时文件和原子发布**：先写入临时目录 `data/unified_swe_dataset_v1.tmp/`，5 个文件全部通过发布硬门槛后才原子替换为正式目录。失败时旧版本保持不变，下次从 SQLite 最近的兼容阶段继续。
-- **状态清理**：构建成功后默认保留 SQLite，便于复现和增量更新；显式 `--clean-state` 只能在正式目录完成哈希复核后执行。
+而不是重复任务。
 
-### 7.4 教师标注配置
+---
 
-教师 API 通过环境变量传入，密钥不得写入脚本、SQLite、manifest 或发布文件：
+## 11.3 `supervision`
 
-```powershell
-# 按 TEACHER_API_KEY、DEEPSEEK_API_KEY 优先级读取
-$env:TEACHER_API_KEY = "sk-..."
-# 可选：兼容代理
-$env:TEACHER_BASE_URL = "https://your-proxy.example.com"
+该区域用于训练 / evaluation，不属于模型输入。
+
+主要包括：
+
+```text
+level
+training_targets
+recommended_weight
+evidence_labels
+modified_files
+gold_patch
+test_patch
+hard_negative_evidence_ids
+obligations
+policy_states
+label_provenance
 ```
 
-`.env` 中的通用 `LLM_MODEL` 不得覆盖冻结模型 `deepseek-v4-flash`。教师阶段环境变量全部缺失时，确定性阶段继续运行，正式发布在教师阶段硬失败，不生成降级数据集。
+训练 DataLoader 必须明确区分：
 
-## 八、仓库目录结构
-
+```text
+model-visible fields
+vs
+supervision-only fields
 ```
+
+---
+
+## 11.4 Candidate Action Schema
+
+每个 policy state 包含多个 candidate actions。
+
+关键字段：
+
+```text
+action_id
+action_type
+evidence_ids
+candidate_scope
+candidate_sources
+online_retrieval_rank
+online_retrieval_score
+completion_gain
+progress_gain
+action_label
+action_loss_mask
+scoreable
+```
+
+---
+
+## 11.5 Candidate Scope
+
+三种 scope：
+
+```text
+online
+offline_injected
+stop
+```
+
+### online
+
+真实 online Retriever 可以生成。
+
+### offline_injected
+
+只因为离线 Gold / witness / supervision 需要而注入。
+
+作用：
+
+> 即使 Retriever 漏掉 Gold positive，也让 Ranker 仍然可以学习这个 positive。
+
+但：
+
+```text
+offline_injected
+```
+
+绝不能伪装成 online retrieval success。
+
+### stop
+
+STOP 特殊动作。
+
+---
+
+# 12. 监督体系
+
+当前项目遵循“高确定性优先”的 supervision 构建原则。
+
+---
+
+## 12.1 Deterministic Supervision
+
+来源包括：
+
+```text
+Git diff
+pre-fix span mapping
+file / symbol structure
+AST-like code structure
+patch old-side anchors
+containment
+adjacency
+duplicate / overlap rules
+```
+
+这些监督成本低、可重放、可审计。
+
+---
+
+## 12.2 Cross-source Supervision
+
+主要来自当前冻结的：
+
+```text
+SWE-bench
+ContextBench
+SWE-Explore
+```
+
+多个来源可靠对齐时，提高监督可信度。
+
+---
+
+## 12.3 Teacher Supervision
+
+Teacher 仅用于规则无法解决的语义歧义。
+
+原则：
+
+```text
+teacher output
+→ deterministic validation
+→ verified label
+```
+
+而不是：
+
+```text
+teacher says it
+→ directly treat as Gold
+```
+
+---
+
+## 12.4 Obligation / Witness
+
+一个任务可以包含多个 Evidence Obligations。
+
+例如：
+
+```text
+fault_location
+fault_logic
+dependency_context
+state_flow
+behavior_constraint
+repair_scope
+validation_constraint
+```
+
+一个 obligation 可以包含多个 witness group。
+
+同一 group：
+
+```text
+A AND B
+```
+
+表示 Evidence 需要组合。
+
+不同 group：
+
+```text
+group_1 OR group_2
+```
+
+表示不同证据路径可以替代。
+
+因此 obligation / witness 天然支持：
+
+```text
+complementarity
+substitutability
+```
+
+---
+
+# 13. 数据泄漏与安全边界
+
+该项目的数据可信度依赖严格的 online/offline 隔离。
+
+---
+
+## 13.1 三种必须避免的泄漏
+
+### Task Leakage
+
+同一 Issue / PR / 等价任务不能跨：
+
+```text
+train
+validation
+benchmark
+```
+
+---
+
+### Code Leakage
+
+模型可见代码必须来自：
+
+```text
+base_commit
+```
+
+禁止：
+
+```text
+post-fix code
+patch added lines
+repair result
+```
+
+作为 online Evidence。
+
+---
+
+### Label Leakage
+
+以下内容不能进入 online Agent：
+
+```text
+gold context marker
+obligation
+witness group
+teacher answer
+patch
+test patch
+behavior outcome
+```
+
+---
+
+## 13.2 V2.10 Structure Leakage 修复
+
+旧实验中发现一个重要风险：
+
+```text
+offline witness
+        ↓
+evidence_by_id
+        ↓
+structure graph
+```
+
+可能导致 Gold supervision 间接成为 online structure node。
+
+V2.10 已改成：
+
+```text
+online lexical evidence
+        ≠
+offline supervision evidence
+```
+
+structure graph 只读取：
+
+```text
+Current K
++
+Canonical pre-fix repository
+```
+
+---
+
+# 14. 当前已验证结果
+
+以下指标属于 **Retriever / Dataset Audit**，不是训练后 Policy Model 的最终性能。
+
+---
+
+## 14.1 Initial Retrieval
+
+V2.10 initial online-positive coverage：
+
+```text
+27.2553%
+```
+
+分 Split：
+
+| Split | Initial Coverage |
+|---|---:|
+| Train | 26.2604% |
+| Validation | 42.1525% |
+| Benchmark | 33.7696% |
+
+Initial state：
+
+```text
+K = ∅
+```
+
+因此这些指标主要衡量 first-hop lexical Retriever。
+
+---
+
+## 14.2 Canonical Structure Increment
+
+Decision Boundary clean lexical baseline：
+
+```text
+45.6835%
+```
+
+加入合法 canonical 1-hop：
+
+```text
+55.0360%
+```
+
+绝对提升：
+
+```text
++9.35 percentage points
+```
+
+这说明 state-aware structure expansion 可以在不使用 Gold witness 的条件下带来明显增益。
+
+---
+
+## 14.3 Official V2.10 Persisted Boundary
+
+当前正式 V2.10 persisted boundary：
+
+```text
+55.2158%
+```
+
+Structure-positive hit：
+
+```text
+238 / 556
+= 42.8058%
+```
+
+clean canonical audit 中 structure-positive hit 同样为：
+
+```text
+238 / 556
+```
+
+说明正式 builder 与 clean structure semantics 已对齐。
+
+---
+
+## 14.4 Policy Integrity
+
+当前 Policy：
+
+```text
+invalid evidence reference = 0
+invalid state              = 0
+invalid STOP state         = 0
+orphan action              = 0
+```
+
+---
+
+## 14.5 Scoreability Audit
+
+当前 V2.10：
+
+```text
+positive label actions       = 43,855
+positive loss-active actions = 43,855
+positive masked              = 0
+```
+
+意味着：
+
+> 没有任何 positive action 因 4096-token scoreability 限制失去训练监督。
+
+当前有：
+
+```text
+236 unscoreable actions
+```
+
+全部为 online pair，并且没有 positive。
+
+---
+
+# 15. 项目目录建议
+
+当前仓库建议组织为：
+
+```text
 evidence-agent/
+├── README.md
+│
 ├── scripts/
-│   ├── build_unified_dataset.py          # 唯一构建入口（当前主入口）
-│   ├── 00_audit_local_datasets.py        # 早期：本地数据集审计
-│   ├── 01_normalize_local_sources.py     # 早期：原始数据规范化
-│   ├── 02_build_master_registry.py       # 早期：Master Instance Registry
-│   ├── 03_freeze_splits.py               # 早期：数据集划分
-│   ├── 04_prepare_git_snapshots.py       # 早期：Git 快照准备
-│   ├── 04b_repair_git_snapshot_failures.py
-│   ├── 05_extract_evidence_anchors.py     # 早期：证据 anchor 抽取
-│   ├── 06_extract_pre_fix_evidence_units.py  # 早期：修复前 Evidence Unit
-│   ├── 07_build_certification_labels.py   # 早期：认证标签
-│   ├── 08_build_release_dataset.py        # 早期：MVP 发布
-│   └── 11_build_full_repository_corpus.py # 早期：完整仓库语料构建器
+│   ├── build_unified_dataset_v2_10.py
+│   ├── audit_retriever_policy_coverage.py
+│   ├── audit_boundary_clean_structure_v2_9.py
+│   ├── audit_policy_scoreability_v2_10.py
+│   │
+│   ├── train_evidence_policy.py              # 下一阶段
+│   ├── evaluate_evidence_policy.py           # 下一阶段
+│   └── run_evidence_agent.py                 # 下一阶段
+│
 ├── data/
-│   ├── raw/                               # 冻结原始来源（SWE-bench / ContextBench / SWE-Explore）
-│   ├── cache/                             # 外部仓库 bare clone 缓存（gitignore）
-│   ├── .build/                            # 构建状态 SQLite 和日志
-│   ├── processed/                         # 早期中间产物
-│   ├── registry/                          # 早期注册表
-│   ├── splits/                            # 早期划分
-│   ├── release/                           # 早期 MVP 发布（已冻结为 debug dataset）
-│   └── unified_swe_dataset_v1/            # 最终发布（5 个文件）
-├── docs/superpowers/
-│   ├── plans/                             # 实现计划
-│   └── specs/                             # 设计规格
-├── findings.md                            # 研究发现
-├── progress.md                            # 进度跟踪
-├── task_plan.md                           # 任务计划
-├── 执行方案v4.md
-├── 项目创新点_修订版.md
-└── 项目进展.md                            # 阶段总结与后续执行路线
+│   ├── raw/
+│   │   ├── swebench/
+│   │   ├── contextbench/
+│   │   └── swe_explore/
+│   │
+│   ├── cache/
+│   │   └── repos/
+│   │
+│   ├── .build/
+│   │   ├── unified_swe_v1.sqlite3
+│   │   ├── retriever_v2_2_fts.sqlite3
+│   │   └── audit_*/
+│   │
+│   └── unified_swe_dataset_v2_10/
+│       ├── train_v2_10.parquet
+│       ├── validation_v2_10.parquet
+│       ├── benchmark_v2_10.parquet
+│       ├── repository_corpus_v2_10.parquet
+│       └── manifest_v2_10.json
+│
+├── configs/                                  # 推荐新增
+│   ├── train/
+│   ├── eval/
+│   └── agent/
+│
+├── checkpoints/                              # 推荐新增
+│
+├── experiments/                              # 推荐新增
+│
+└── docs/
+    ├── 执行方案v4.md
+    ├── 项目创新点_修订版.md
+    └── 2026-07-30-unified-swe-release-schema-design.md
 ```
 
-> 注：`scripts/01_*.py`～`scripts/11_*.py` 是早期分阶段脚本，对应 MVP（候选级证据数据集）。当前正式路径统一收敛到 `scripts/build_unified_dataset.py` 单脚本，不再新增分阶段脚本或外部配置文件。早期 MVP 已冻结为 debug dataset，不能用于正式主实验。
+注意：
 
-## 九、评测体系
+> 标记为“下一阶段 / 推荐新增”的文件和目录是规划接口，不应被理解为当前仓库中已经实现。
 
-benchmark 支持内部完整版（`gold_visibility=evaluator_only`）和对外脱敏版（`gold_visibility=private`）两种 flavor。所有证据类评测必须分别报告两种候选模式：
+---
 
-- **`oracle_candidate_ranking`**：向候选池注入缺失 Gold，只评估 Cross-Encoder 对已给定候选的排序、组合与 STOP 能力；
-- **`end_to_end_online`**：候选只能由问题、当前证据和 pre-fix 仓库生成，不允许 Gold 注入，用于评估规则召回与 Cross-Encoder 组成的完整系统。
+# 16. 环境与依赖
 
-主要指标维度：
+当前 Builder 为 Python 实现。
 
-| 类别 | 指标 |
-|------|------|
-| 检索 | File Recall@k、Symbol Recall@k、Span Recall@B、MRR、NDCG、Supporting Unit Recall、Core Context Recall |
-| 证据 | Evidence Precision/Recall/F1、Mandatory Obligation Coverage、Structural Path Accuracy、Alternative Evidence Recall |
-| 证书 | Certificate Exact Match、Certificate Family Recall、Inclusion-Minimal Accuracy、Minimum-Cost Regret、Premature Certification Rate、False EXPAND Rate、ABSTAIN Accuracy |
-| 成本 | Evidence tokens、代码行数、Evidence Unit 数量、检索步数、tool calls、GPU latency、LLM/API cost |
-| 下游行为 | Resolved Rate、FAIL_TO_PASS、PASS_TO_PASS、Repair-Cost curve、AUC-Repair-Cost |
+推荐环境：
 
-实验章节只保留对比实验和消融实验两条主线，不增加补丁生成、测试执行或真实修复成功率评测。
+```text
+Python 3.10+
+Git
+SQLite with FTS5
+```
 
-## 十、关键设计原则
+核心 Python 依赖至少包括：
 
-1. 每个问题只能检索自己的 `snapshot_id`；不能只根据 repo 过滤，同一仓库不同 commit 的代码不能混用。
-2. Gold patch、test patch、trajectory、gold context 只能用于离线标签，不能进入在线 Agent 状态。
-3. FullRepo 评测时禁止 force-positive，未召回就是 Retriever 失败。
-4. 不要把成功轨迹中的所有读取自动视为必要证据（`trajectory 读取过 ≠ 证据必需`）。
-5. 未被 Gold 选中的候选只表示未知，只有满足明确反证规则的单元才能标为 hard negative。
-6. 同一任务可能存在多组充分证书，正例必须是集合值 `acceptable_next_unit_ids`，不能只有一个 `positive_unit_id`。
-7. 不要把百万级 pair 数当成百万独立任务，必须同时报告独立任务数、状态数、动作数和候选数。
-8. 教师标签只能进入 weak supervision / semantic audit / unresolved adjudication，不能采用「LLM 生成 gold → 同一个 LLM 判断 gold → 作为真实标签」的闭环。
+```text
+transformers
+pyarrow
+httpx
+```
 
-完整的设计原则与发布硬门槛见 [docs/superpowers/specs/2026-07-30-unified-swe-release-schema-design.md](file:///e:/Code_Personal/Subject/evidence-agent/docs/superpowers/specs/2026-07-30-unified-swe-release-schema-design.md)。
+SQLite、AST、asyncio 等使用 Python 标准库。
 
-## 十一、文档索引
+---
 
-| 文档 | 内容 |
-|------|------|
-| [项目进展.md](file:///e:/Code_Personal/Subject/evidence-agent/项目进展.md) | 阶段总结、已完成工作、质量审计与后续执行路线 |
-| [项目创新点_修订版.md](file:///e:/Code_Personal/Subject/evidence-agent/项目创新点_修订版.md) | 三项核心贡献的完整论述与公式 |
-| [执行方案v4.md](file:///e:/Code_Personal/Subject/evidence-agent/执行方案v4.md) | 执行方案 |
-| [findings.md](file:///e:/Code_Personal/Subject/evidence-agent/findings.md) | 研究发现 |
-| [progress.md](file:///e:/Code_Personal/Subject/evidence-agent/progress.md) | 进度跟踪 |
-| [task_plan.md](file:///e:/Code_Personal/Subject/evidence-agent/task_plan.md) | 任务计划 |
-| [docs/superpowers/specs/2026-07-30-unified-swe-release-schema-design.md](file:///e:/Code_Personal/Subject/evidence-agent/docs/superpowers/specs/2026-07-30-unified-swe-release-schema-design.md) | Unified SWE Dataset 发布结构与任务 Schema 设计 |
-| [docs/superpowers/specs/2026-07-30-certievidence-data-v2-design.md](file:///e:/Code_Personal/Subject/evidence-agent/docs/superpowers/specs/2026-07-30-certievidence-data-v2-design.md) | CertiEvidence 数据 v2 设计 |
+## 16.1 Conda 示例
 
-## 十二、许可证与数据来源
+PowerShell：
 
-数据来源许可证：
+```powershell
+conda create -n evidence-agent python=3.11 -y
+conda activate evidence-agent
 
-| 来源 | 许可证 |
-|------|--------|
-| SWE-bench | MIT |
-| ContextBench | Apache-2.0 |
-| SWE-Explore | MIT |
+pip install transformers pyarrow httpx
+```
 
-相关上游项目：
+如果已有项目级 `requirements.txt` / `pyproject.toml`，应优先按照仓库锁定版本安装，而不是依赖上面的最小示例。
 
-- SWE-bench：https://github.com/princeton-nlp/SWE-bench
-- ContextBench
-- SWE-Explore：https://github.com/Qiushao-E/SWE-Explore-Bench
+---
+
+## 16.2 Hugging Face Cache
+
+如果 tokenizer 已缓存在用户目录，可以设置：
+
+```powershell
+$env:HF_HOME = "$HOME\.cache\huggingface"
+```
+
+V2.10 token accounting contract：
+
+```text
+Tokenizer:
+BAAI/bge-reranker-v2-m3
+
+Revision:
+953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+```
+
+---
+
+## 16.3 SQLite FTS5 检查
+
+Retriever 使用 SQLite FTS5 sidecar。
+
+可以检查：
+
+```powershell
+python -c "import sqlite3; c=sqlite3.connect(':memory:'); c.execute('CREATE VIRTUAL TABLE x USING fts5(t)'); print('FTS5 OK')"
+```
+
+---
+
+# 17. 数据构建与发布
+
+主构建器：
+
+```text
+scripts/build_unified_dataset_v2_10.py
+```
+
+内部阶段：
+
+```text
+sources
+normalize
+identity
+split
+snapshots
+corpus
+supervision
+teacher
+policy
+write
+audit
+publish
+```
+
+---
+
+## 17.1 Self-test
+
+```powershell
+python scripts/build_unified_dataset_v2_10.py --self-test
+```
+
+---
+
+## 17.2 Policy 性能试跑
+
+V2.10 直接复用 working SQLite：
+
+```text
+data/.build/unified_swe_v1.sqlite3
+```
+
+Policy rebuild 会原地更新：
+
+```text
+policy_states
+candidate_actions
+policy / write / audit / publish checkpoints
+```
+
+不会修改冻结的 V1 release 目录。
+
+示例：
+
+```powershell
+$env:HF_HOME = "$HOME\.cache\huggingface"
+
+python scripts/build_unified_dataset_v2_10.py `
+  --format parquet `
+  --through-phase policy `
+  --max-policy-tasks 100 `
+  --confirm-inplace-policy-rebuild
+```
+
+---
+
+## 17.3 全量 Policy
+
+```powershell
+python scripts/build_unified_dataset_v2_10.py `
+  --format parquet `
+  --through-phase policy `
+  --confirm-inplace-policy-rebuild `
+  2>&1 | Tee-Object -FilePath data/.build/policy_v2_10_full.log
+```
+
+---
+
+## 17.4 正式发布
+
+```powershell
+python scripts/build_unified_dataset_v2_10.py `
+  --format parquet `
+  --release `
+  --through-phase publish `
+  --confirm-inplace-policy-rebuild `
+  2>&1 | Tee-Object -FilePath data/.build/release_v2_10.log
+```
+
+正式发布必须：
+
+```text
+--format parquet
+```
+
+Builder 会执行：
+
+```text
+write staging
+    ↓
+audit
+    ↓
+audit_status == passed
+    ↓
+atomic publish
+```
+
+---
+
+# 18. 审计与质量门禁
+
+V2.10 release 前至少经过以下三类审计。
+
+---
+
+## 18.1 Retriever Coverage Audit
+
+```powershell
+python scripts/audit_retriever_policy_coverage.py `
+  --db data/.build/unified_swe_v1.sqlite3 `
+  --output-dir data/.build/audit_retriever_policy_coverage_v2_10
+```
+
+重点指标：
+
+```text
+online_positive_action_coverage
+Recall@1/5/10/20/64
+file_universe_miss
+within_file_or_unit_retrieval_miss
+structure channel hit
+```
+
+---
+
+## 18.2 Clean Structure Audit
+
+```powershell
+python scripts/audit_boundary_clean_structure_v2_9.py `
+  --db data/.build/unified_swe_v1.sqlite3 `
+  --fts data/.build/retriever_v2_2_fts.sqlite3 `
+  --builder scripts/build_unified_dataset_v2_10.py `
+  --output-dir data/.build/audit_boundary_clean_structure_v2_10
+```
+
+检查：
+
+```text
+offline witness 是否进入 online structure graph
+canonical adjacency 是否正确
+1-hop structure 是否真实有效
+```
+
+---
+
+## 18.3 Scoreability Audit
+
+```powershell
+python scripts/audit_policy_scoreability_v2_10.py `
+  --db data/.build/unified_swe_v1.sqlite3 `
+  --output data/.build/audit_policy_scoreability_v2_10/report.json
+```
+
+Release gate：
+
+```text
+overflow_contract_violation_count = 0
+all_positive_masked_state_count   = 0
+```
+
+当前 V2.10 已通过。
+
+---
+
+# 19. 模型训练阶段
+
+> 本节描述下一阶段目标接口。训练脚本尚未在 V2.10 数据构建阶段实现完成。
+
+建议实现：
+
+```text
+scripts/train_evidence_policy.py
+```
+
+---
+
+## 19.1 Training Unit
+
+每个训练 state：
+
+```text
+(q, K, {A_1, ..., A_n})
+```
+
+对所有 candidate action 统一评分：
+
+```text
+score_1 = f(q,K,A_1)
+...
+score_n = f(q,K,A_n)
+```
+
+loss 只允许使用：
+
+```text
+ranking_loss_mask = true
+action_loss_mask  = true
+scoreable         = true
+```
+
+的监督。
+
+---
+
+## 19.2 训练数据
+
+### Train
+
+```text
+train_v2_10.parquet
+```
+
+用于参数更新。
+
+### Validation
+
+```text
+validation_v2_10.parquet
+```
+
+用于：
+
+```text
+validation loss
+early stopping
+checkpoint selection
+regression detection
+```
+
+### Benchmark
+
+```text
+benchmark_v2_10.parquet
+```
+
+不可参与：
+
+```text
+training
+early stopping
+threshold selection
+hyperparameter tuning
+```
+
+---
+
+## 19.3 推荐训练接口
+
+未来命令可设计为：
+
+```powershell
+python scripts/train_evidence_policy.py `
+  --train data/unified_swe_dataset_v2_10/train_v2_10.parquet `
+  --validation data/unified_swe_dataset_v2_10/validation_v2_10.parquet `
+  --corpus data/unified_swe_dataset_v2_10/repository_corpus_v2_10.parquet `
+  --config configs/train/policy.yaml
+```
+
+这是建议接口，不代表当前脚本已经存在。
+
+---
+
+# 20. Agent Online Rollout
+
+训练完成后，真正的系统价值需要通过 iterative rollout 验证。
+
+---
+
+## 20.1 Rollout
+
+```text
+K0 = ∅
+
+Round 1:
+Retriever(q, K0)
+→ Policy
+→ Evidence A
+
+K1 = {A}
+
+Round 2:
+Retriever(q, K1)
++ Structure(K1)
+→ Policy
+→ Evidence B
+
+K2 = {A, B}
+
+Round 3:
+Retriever(q, K2)
++ Structure(K2)
+→ Policy
+→ STOP
+```
+
+最终：
+
+```text
+EvidencePackage(K2)
+```
+
+---
+
+## 20.2 Hard Budget
+
+即使 STOP 校准异常，在线 Agent 也必须有安全预算。
+
+Schema 设计建议区分：
+
+```text
+single model input max = 4096 tokens
+```
+
+与：
+
+```text
+whole acquisition evidence budget
+```
+
+两者不是同一个概念。
+
+Coordinator 应维护：
+
+```text
+max selected evidence units
+max accumulated evidence tokens
+max rounds / tool calls
+```
+
+硬预算仅用于防止无界探索。
+
+---
+
+# 21. 评估体系
+
+项目评估必须把三层问题拆开。
+
+---
+
+## 21.1 Retriever Evaluation
+
+回答：
+
+> 正 Evidence 是否进入候选池？
+
+指标：
+
+```text
+Online Positive Coverage
+Recall@1
+Recall@5
+Recall@10
+Recall@20
+Recall@64
+
+File Universe Miss
+Within-file / Unit Miss
+Pair Realizability
+Channel Hits
+```
+
+---
+
+## 21.2 Policy Ranking Evaluation
+
+回答：
+
+> 如果正确动作已经在候选池，模型会不会选对？
+
+推荐：
+
+```text
+Action Hit@1
+MRR
+NDCG
+Listwise accuracy
+Single action accuracy
+Pair action accuracy
+STOP accuracy
+```
+
+---
+
+## 21.3 Agent Rollout Evaluation
+
+回答：
+
+> 从 K=∅ 开始，整个系统最终能不能收集到充分 Evidence？
+
+推荐：
+
+```text
+Final obligation coverage
+Context sufficiency rate
+Average acquisition steps
+Mean evidence tokens
+Premature STOP rate
+Late STOP overhead
+Redundant evidence rate
+Substitute duplication rate
+```
+
+---
+
+## 21.4 Oracle vs End-to-End
+
+Benchmark 必须区分：
+
+### Oracle Candidate Ranking
+
+```text
+允许离线注入 Gold candidate
+```
+
+只评价 Policy ranking。
+
+### End-to-End Online
+
+```text
+禁止 offline_injected
+```
+
+完整评价：
+
+```text
+Retriever
++
+Policy
++
+Agent rollout
+```
+
+不能用 Oracle candidate 结果代替端到端结果。
+
+---
+
+# 22. 实验与消融
+
+项目至少建议做以下消融。
+
+---
+
+## 22.1 Retriever Ablation
+
+```text
+Path-only
+vs
+Path + Content FTS
+```
+
+回答：
+
+> Repo-wide content retrieval 是否改善 first-hop reachability？
+
+---
+
+## 22.2 Structure Ablation
+
+```text
+Lexical-only
+vs
+Lexical + Canonical 1-hop Structure
+```
+
+当前 clean boundary 已观察到：
+
+```text
+45.68%
+→
+55.04%
+```
+
+---
+
+## 22.3 State-awareness Ablation
+
+```text
+Stateless scorer
+vs
+State-aware scorer(q,K,A)
+```
+
+回答：
+
+> K 是否真正改变下一条 Evidence 的价值？
+
+---
+
+## 22.4 Pair Ablation
+
+```text
+Single-only
+vs
+Single + Pair
+```
+
+回答：
+
+> 显式组合动作是否有助于识别互补 Evidence？
+
+---
+
+## 22.5 STOP Ablation
+
+```text
+Fixed Top-K / fixed rounds
+vs
+Learned STOP
+```
+
+回答：
+
+> Policy 是否可以减少无效探索？
+
+---
+
+## 22.6 Multi-Agent Ablation
+
+```text
+Static one-shot RAG
+vs
+Iterative Agentic RAG
+vs
+Full Multi-Agent Orchestration
+```
+
+回答：
+
+> 多轮结构探索与角色分工是否带来端到端 Evidence sufficiency 增益？
+
+---
+
+# 23. 当前开发状态
+
+截至 V2.10：
+
+| 模块 | 状态 |
+|---|---|
+| Unified task identity / split | ✅ 已完成 |
+| Pre-fix repository snapshots | ✅ 已完成 |
+| Repository corpus | ✅ 已完成 |
+| Evidence Unit extraction | ✅ 已完成 |
+| Deterministic supervision | ✅ 已完成 |
+| Aligned public supervision | ✅ 已完成 |
+| Verified teacher supervision | ✅ 已完成 |
+| File-level Path + FTS RAG | ✅ 已完成 |
+| Unit-level multi-channel Retriever | ✅ 已完成 |
+| Canonical 1-hop structure | ✅ 已完成 |
+| Single / Pair / STOP policy dataset | ✅ 已完成 |
+| Leakage audit | ✅ 已完成 |
+| Scoreability audit | ✅ 已完成 |
+| V2.10 Parquet release | ✅ 已完成 |
+| Cross-Encoder Policy training | ⏳ 下一阶段 |
+| Offline Policy evaluator | ⏳ 下一阶段 |
+| Multi-Agent runtime | ⏳ 下一阶段 |
+| End-to-end rollout evaluator | ⏳ 下一阶段 |
+| Final ablation / paper experiments | ⏳ 下一阶段 |
+
+---
+
+# 24. 下一阶段路线图
+
+推荐后续工作顺序：
+
+```text
+V2.10 Dataset Freeze
+        ↓
+Cross-Encoder Evidence Policy Training
+        ↓
+Validation / Model Selection
+        ↓
+Frozen Benchmark Evaluation
+        ↓
+Multi-Agent Online Rollout
+        ↓
+Context Sufficiency Evaluation
+        ↓
+Ablation
+        ↓
+Paper / Report
+```
+
+---
+
+## Phase 1：Dataset Freeze
+
+保存：
+
+```text
+dataset_version
+manifest SHA-256
+retriever_version
+schema_version
+```
+
+V2.10 后不要再因为模型实验随意重构数据。
+
+---
+
+## Phase 2：Policy Training
+
+实现：
+
+```text
+train_evidence_policy.py
+```
+
+重点：
+
+```text
+single
+pair
+STOP
+```
+
+统一动作空间。
+
+---
+
+## Phase 3：Offline Evaluation
+
+实现：
+
+```text
+evaluate_evidence_policy.py
+```
+
+分别报告：
+
+```text
+oracle candidate ranking
+end-to-end online candidate ranking
+```
+
+---
+
+## Phase 4：Multi-Agent Runtime
+
+实现：
+
+```text
+run_evidence_agent.py
+```
+
+集成：
+
+```text
+Problem Analysis
+Retriever
+Canonical Structure
+Policy
+Coordinator / Sufficiency
+```
+
+---
+
+## Phase 5：Full Rollout
+
+在 benchmark 上从：
+
+```text
+K = ∅
+```
+
+开始完整重放 Evidence Acquisition。
+
+---
+
+## Phase 6：Research Experiments
+
+完成：
+
+```text
+Retriever ablation
+Structure ablation
+State-aware ablation
+Pair ablation
+STOP ablation
+Multi-agent ablation
+```
+
+---
+
+# 25. 版本与复现
+
+所有实验建议保存：
+
+```text
+dataset_name
+dataset_version
+manifest_sha256
+retriever_version
+schema_version
+script_version
+model_backbone
+model_revision
+tokenizer_revision
+training_config_hash
+random_seed
+checkpoint_sha256
+evaluation_config_hash
+```
+
+---
+
+## 25.1 V2.10 Manifest 关键版本
+
+```text
+dataset_version:
+2.10.0
+
+schema_version:
+1.0
+
+script_version:
+0.2.10
+
+retriever:
+retriever-v2.10-stream-fts-clean-canonical-1hop-head-rrf
+```
+
+---
+
+## 25.2 Release File Hashes
+
+### Train
+
+```text
+a2678511baf43737ab2001ede5dda4bbb5a0ab0f53c581b5509d9dfa1fc83d21
+```
+
+### Validation
+
+```text
+fd74626186511abfef6b46a84e8d9641fd255134f9652da9408afba7bcc00539
+```
+
+### Benchmark
+
+```text
+a2e6125cb27d815d997713a060c66177b43f15a60c2261a373af10bf91475240
+```
+
+### Repository Corpus
+
+```text
+7660e420c8fd19dea03217e1a72c3c4656a48b3b61275d5c94e74565322aba72
+```
+
+---
+
+# 26. 数据来源与许可证
+
+当前 V2.10 manifest 中正式记录三类来源。
+
+| Dataset | Role | License |
+|---|---|---|
+| SWE-bench | Task baseline | MIT |
+| ContextBench | Aligned overlay | Apache-2.0 |
+| SWE-Explore | Aligned overlay | MIT |
+
+任何外部来源必须：
+
+```text
+reliably align to SWE task
+```
+
+才能进入统一任务记录。
+
+---
+
+## 26.1 SWE-bench
+
+提供：
+
+```text
+repo
+base_commit
+problem_statement
+patch
+test_patch
+```
+
+作用：
+
+```text
+task baseline
+patch-derived supervision
+benchmark identity
+```
+
+---
+
+## 26.2 ContextBench
+
+作用：
+
+```text
+aligned contextual supervision
+file/span evidence support
+strong supervision overlay
+```
+
+---
+
+## 26.3 SWE-Explore
+
+作用：
+
+```text
+aligned evidence regions
+trajectory-derived support
+sequence/context supervision
+```
+
+---
+
+# 27. FAQ
+
+## Q1：这个项目是 RAG 项目吗？
+
+是，但不只是 RAG。
+
+RAG 负责：
+
+```text
+candidate generation
+```
+
+Policy 负责：
+
+```text
+state-conditioned action selection
+```
+
+Multi-Agent 负责：
+
+```text
+iterative orchestration
+```
+
+---
+
+## Q2：为什么不直接让大模型读完整仓库？
+
+因为：
+
+- 仓库规模过大；
+- token 成本高；
+- 噪声高；
+- 很难研究“哪条 Evidence 真正有价值”；
+- 不利于可解释、可复现的 Evidence Acquisition。
+
+因此项目先把仓库转换为 Evidence Units。
+
+---
+
+## Q3：为什么 Retriever 不直接训练？
+
+当前研究设计希望把：
+
+```text
+candidate reachability
+```
+
+与：
+
+```text
+policy learning
+```
+
+分开。
+
+Retriever 使用 deterministic lexical / path / symbol / structure rules。
+
+最终只训练一个 Cross-Encoder Evidence Policy。
+
+---
+
+## Q4：为什么需要 Pair Action？
+
+软件修复证据常常存在互补关系。
+
+例如：
+
+```text
+buggy logic
++
+caller constraint
+```
+
+可能单独都不足，但组合后能够解释问题。
+
+Pair action 让策略能够显式学习这类组合价值。
+
+---
+
+## Q5：为什么 STOP 不能单独训练一个 classifier？
+
+因为 STOP 本质上也是当前状态下的动作决策。
+
+项目希望统一比较：
+
+```text
+下一条 Evidence 的价值
+vs
+继续探索已经没有价值
+```
+
+所以 STOP 和 Evidence action 位于同一 score space。
+
+---
+
+## Q6：为什么旧 boundary 76% 不再作为目标？
+
+旧实验发现部分 structure graph 会受到 offline witness / subset adjacency 的污染。
+
+因此该数字不是严格 clean online retrieval。
+
+V2.10 修复后，canonical structure 只读取：
+
+```text
+current K
++
+pre-fix repository
+```
+
+当前约 55% 的 clean boundary coverage 更符合真实在线语义。
+
+---
+
+## Q7：为什么 initial coverage 只有约 27%？
+
+因为该指标要求：
+
+```text
+K = ∅
+```
+
+时 Retriever 直接在 Top-64 online candidates 中召回正 Evidence。
+
+这是非常严格的 first-hop 指标。
+
+Agentic 系统的目标不是第一轮一次找全，而是：
+
+```text
+initial retrieval
+→ K
+→ canonical structure
+→ next acquisition
+→ ...
+→ sufficient context
+```
+
+最终更重要的是：
+
+```text
+full rollout context sufficiency
+```
+
+而不是单独追求 `Recall@64(K=∅)`。
+
+---
+
+## Q8：项目会输出 Patch 吗？
+
+当前不会。
+
+当前项目输出：
+
+```text
+Evidence Package
+```
+
+Patch generation 属于下游 repair model 的职责。
+
+---
+
+## Q9：V2.10 是否支持多语言？
+
+当前正式 release 和 Builder 的模型输入语言范围按现有实现固定为：
+
+```text
+Python
+```
+
+当前 README 不声称已经实现多语言 Evidence extraction / training / evaluation。
+
+---
+
+## Q10：多智能体是不是意味着训练很多模型？
+
+不是。
+
+多智能体表示不同的工作角色：
+
+```text
+analysis
+retrieval
+structure exploration
+policy decision
+coordination
+```
+
+核心可训练 Policy 仍然只有一套参数。
+
+---
+
+# 28. 项目事实来源
+
+本 README 以当前实际代码、最终发布 Manifest 和项目设计文档为依据。
+
+主要事实来源：
+
+```text
+scripts/build_unified_dataset_v2_10.py
+data/unified_swe_dataset_v2_10/manifest_v2_10.json
+
+执行方案v4.md
+项目创新点_修订版.md
+2026-07-30-unified-swe-release-schema-design.md
+```
+
+事实优先级建议：
+
+```text
+最终 Release Manifest
+        ↓
+当前 Builder / Audit 代码
+        ↓
+冻结数据 Schema
+        ↓
+设计方案与研究规划文档
+```
+
+当设计文档与实际 V2.10 实现不一致时，应以当前代码和最终发布 Manifest 为准。
+
+---
+
+# Summary
+
+Evidence Agent 的整体目标可以压缩成一句话：
+
+> **通过多通道 RAG 提供候选，通过唯一的状态条件化 Evidence Policy 学习“Gather / Combine / Skip”，并由多智能体运行时组织多轮仓库探索，在不使用 Gold leakage 的前提下获取达到预定义修复上下文充分性标准的 Evidence Package。**
+
+当前 V2.10 已经完成：
+
+```text
+Dataset
++
+Repository Corpus
++
+RAG
++
+Canonical Structure
++
+Policy Supervision
++
+Leakage / Integrity Audit
+```
+
+下一阶段重点是：
+
+```text
+Cross-Encoder Training
++
+Policy Evaluation
++
+Multi-Agent Rollout
++
+Context Sufficiency Evaluation
+```
