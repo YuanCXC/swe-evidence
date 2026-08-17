@@ -2,6 +2,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from scripts import release_dataset
 
@@ -173,6 +175,45 @@ class ReleaseDatasetTest(unittest.TestCase):
                 download_dir,
                 gh_bin="definitely-missing-gh",
             )
+
+    def test_parallel_upload_skips_matching_remote_assets(self):
+        manifest = self.build_manifest()
+        policy_entry = next(
+            entry
+            for entry in manifest["files"]
+            if entry["path"] == "policy_evidence.parquet"
+        )
+        upload_calls = []
+
+        def fake_run_gh(_gh_bin, arguments):
+            if arguments[:2] == ["release", "view"]:
+                return SimpleNamespace(
+                    stdout=json.dumps(
+                        {
+                            "assets": [
+                                {
+                                    "name": policy_entry["asset"],
+                                    "size": policy_entry["size"],
+                                }
+                            ]
+                        }
+                    )
+                )
+            upload_calls.append(arguments)
+            return SimpleNamespace(stdout="")
+
+        with mock.patch.object(release_dataset, "_run_gh", side_effect=fake_run_gh):
+            uploaded, skipped = release_dataset.upload_assets(
+                self.manifest_path,
+                self.source_dir,
+                self.parts_dir,
+                gh_bin="fake-gh",
+                jobs=4,
+            )
+
+        self.assertEqual(["policy_evidence.parquet"], skipped)
+        self.assertIn("tasks.parquet", uploaded)
+        self.assertEqual(len(uploaded), len(upload_calls))
 
 
 if __name__ == "__main__":

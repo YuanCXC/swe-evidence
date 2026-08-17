@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -292,8 +293,11 @@ def upload_assets(
     source_dir: Path,
     parts_dir: Path,
     gh_bin: str = "gh",
+    jobs: int = 4,
 ) -> tuple[list[str], list[str]]:
     """Upload missing assets and skip remote assets with matching names and sizes."""
+    if jobs <= 0:
+        raise ValueError("jobs must be greater than zero")
     manifest = _load_manifest(Path(manifest_path))
     repository = manifest["repository"]
     release_tag = manifest["release_tag"]
@@ -306,7 +310,7 @@ def upload_assets(
         asset["name"]: int(asset["size"])
         for asset in json.loads(view.stdout).get("assets", [])
     }
-    uploaded: list[str] = []
+    pending: list[Path] = []
     skipped: list[str] = []
     for asset in assets:
         remote_size = remote_assets.get(asset.name)
@@ -317,6 +321,9 @@ def upload_assets(
                 )
             skipped.append(asset.name)
             continue
+        pending.append(asset)
+
+    def upload_one(asset: Path) -> str:
         _run_gh(
             gh_bin,
             [
@@ -328,7 +335,10 @@ def upload_assets(
                 repository,
             ],
         )
-        uploaded.append(asset.name)
+        return asset.name
+
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        uploaded = list(executor.map(upload_one, pending))
     return uploaded, skipped
 
 
@@ -428,6 +438,7 @@ def _build_parser() -> argparse.ArgumentParser:
     upload.add_argument("--source-dir", required=True, type=_path)
     upload.add_argument("--parts-dir", required=True, type=_path)
     upload.add_argument("--gh-bin", default="gh")
+    upload.add_argument("--jobs", type=int, default=4)
 
     download = subparsers.add_parser("download", help="Download GitHub Release assets")
     download.add_argument("--manifest", required=True, type=_path)
@@ -461,7 +472,7 @@ def main() -> int:
             print(path)
     elif args.command == "upload":
         uploaded, skipped = upload_assets(
-            args.manifest, args.source_dir, args.parts_dir, args.gh_bin
+            args.manifest, args.source_dir, args.parts_dir, args.gh_bin, args.jobs
         )
         print(json.dumps({"uploaded": uploaded, "skipped": skipped}, indent=2))
     elif args.command == "download":
