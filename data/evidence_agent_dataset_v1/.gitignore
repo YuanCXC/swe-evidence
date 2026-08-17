@@ -1,0 +1,6 @@
+/.release_parts/
+/policy_evidence.parquet
+/repository_runtime.sqlite3
+/repository_runtime.sqlite3.part-*
+/tasks.parquet
+/*.partial

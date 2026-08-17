@@ -1,0 +1,234 @@
+{
+  "chunk_size": 1992294400,
+  "files": [
+    {
+      "asset": "policy_evidence.parquet",
+      "mode": "single",
+      "path": "policy_evidence.parquet",
+      "sha256": "e2e446762aa08b621d0635e049be225916e19086c2658ef50080de89a4bc4a77",
+      "size": 470383294
+    },
+    {
+      "mode": "parts",
+      "parts": [
+        {
+          "index": 1,
+          "name": "repository_runtime.sqlite3.part-00001-of-00034",
+          "sha256": "328271ea34d9ed4aa44db9c0f91f260a485c2f17946de7e3e05351ab73a5b5db",
+          "size": 1992294400
+        },
+        {
+          "index": 2,
+          "name": "repository_runtime.sqlite3.part-00002-of-00034",
+          "sha256": "5fe000a8dfa66a0519f7341c04f69b0a7fd4c3a5a066f513df1b783ebcafb8c4",
+          "size": 1992294400
+        },
+        {
+          "index": 3,
+          "name": "repository_runtime.sqlite3.part-00003-of-00034",
+          "sha256": "6cf1f600ccab8c76be56c4a7b17fba3c765c7ddcb089c7a56720ed1f89702420",
+          "size": 1992294400
+        },
+        {
+          "index": 4,
+          "name": "repository_runtime.sqlite3.part-00004-of-00034",
+          "sha256": "9e60082b3444933409384c1d6870ad91f135eb2c2b8ec3cb1c1db0e3bdfedc4f",
+          "size": 1992294400
+        },
+        {
+          "index": 5,
+          "name": "repository_runtime.sqlite3.part-00005-of-00034",
+          "sha256": "f82eb209f777fd771f76d9f2f1096a0a3b524a9bf10c8db649319c61bd81c458",
+          "size": 1992294400
+        },
+        {
+          "index": 6,
+          "name": "repository_runtime.sqlite3.part-00006-of-00034",
+          "sha256": "3de6f69c4e42f81cce5927303fdd24898a94b5f224ce7a34d04ea6cf62fb0837",
+          "size": 1992294400
+        },
+        {
+          "index": 7,
+          "name": "repository_runtime.sqlite3.part-00007-of-00034",
+          "sha256": "0855b3a0f15d90bb0e367a9e9182e9f2372028c85fe06916d8f8a4d3065492fc",
+          "size": 1992294400
+        },
+        {
+          "index": 8,
+          "name": "repository_runtime.sqlite3.part-00008-of-00034",
+          "sha256": "f5f6423ddbc3d88af3e5a0bf4a9d9df16570b1c9291814193ce79dd7bd1d391a",
+          "size": 1992294400
+        },
+        {
+          "index": 9,
+          "name": "repository_runtime.sqlite3.part-00009-of-00034",
+          "sha256": "45dcd9895de6e793ad887c187b9dade396a96f7b4c6e466f6a2cd45b31eef694",
+          "size": 1992294400
+        },
+        {
+          "index": 10,
+          "name": "repository_runtime.sqlite3.part-00010-of-00034",
+          "sha256": "bd8098497962889169b1499f23f22795d19f5e203a27e2a25030cbba3264f523",
+          "size": 1992294400
+        },
+        {
+          "index": 11,
+          "name": "repository_runtime.sqlite3.part-00011-of-00034",
+          "sha256": "4105843c375d6cc5c2e519504c78e29ad51f29ccc3fa421d3b58c65f4b1c7474",
+          "size": 1992294400
+        },
+        {
+          "index": 12,
+          "name": "repository_runtime.sqlite3.part-00012-of-00034",
+          "sha256": "1d255ca86eba3a30dbfd4078945be6e1b9af72e39d96dd23d8a04deddfbc0549",
+          "size": 1992294400
+        },
+        {
+          "index": 13,
+          "name": "repository_runtime.sqlite3.part-00013-of-00034",
+          "sha256": "ee2242828dce4ef2871dc6feffa2ae2af67f8887c64d4bfe6acf7f6e8c970ff2",
+          "size": 1992294400
+        },
+        {
+          "index": 14,
+          "name": "repository_runtime.sqlite3.part-00014-of-00034",
+          "sha256": "cb4a4f0a693e263abbb7891bc521250ff95db9726a6c7952f30840ba564654c3",
+          "size": 1992294400
+        },
+        {
+          "index": 15,
+          "name": "repository_runtime.sqlite3.part-00015-of-00034",
+          "sha256": "04fa9799c4cc4ec2fdee56e77808f0c3774c9c9f0269000045e814b63e7d10b3",
+          "size": 1992294400
+        },
+        {
+          "index": 16,
+          "name": "repository_runtime.sqlite3.part-00016-of-00034",
+          "sha256": "20caefa9d4540b7e86c2bd65947e6380034b6adf5c9f00408dd8a4d5415ce4ef",
+          "size": 1992294400
+        },
+        {
+          "index": 17,
+          "name": "repository_runtime.sqlite3.part-00017-of-00034",
+          "sha256": "8c82630a6e13d471649470488b0aa41659b6a011ad73fccf431d0241c2c531c6",
+          "size": 1992294400
+        },
+        {
+          "index": 18,
+          "name": "repository_runtime.sqlite3.part-00018-of-00034",
+          "sha256": "5d2e22eec6a72b42da62745e45590adc1298f760b677df6355c33708dbe31a25",
+          "size": 1992294400
+        },
+        {
+          "index": 19,
+          "name": "repository_runtime.sqlite3.part-00019-of-00034",
+          "sha256": "89cd3abab75572ca93c93384cb3d2dd5bb9b0592875e50c95222af09471e3a12",
+          "size": 1992294400
+        },
+        {
+          "index": 20,
+          "name": "repository_runtime.sqlite3.part-00020-of-00034",
+          "sha256": "3c2ec0023b8849f50c81633184cf92b0e8c4b34720c0b7cd1135b2bb14e53cb4",
+          "size": 1992294400
+        },
+        {
+          "index": 21,
+          "name": "repository_runtime.sqlite3.part-00021-of-00034",
+          "sha256": "121a01fefc86e5102ff5073d54fd361ef9ec91ce19c916cc0e96dc186a99c7a3",
+          "size": 1992294400
+        },
+        {
+          "index": 22,
+          "name": "repository_runtime.sqlite3.part-00022-of-00034",
+          "sha256": "79a594547ef7d37d5a219a2f612e997b292ed3235081b6b8d34c630f991c4445",
+          "size": 1992294400
+        },
+        {
+          "index": 23,
+          "name": "repository_runtime.sqlite3.part-00023-of-00034",
+          "sha256": "ef295d23001c0222ef89368e194e4b98b0ba08a8a7c80d7b88ddae8db71a5f62",
+          "size": 1992294400
+        },
+        {
+          "index": 24,
+          "name": "repository_runtime.sqlite3.part-00024-of-00034",
+          "sha256": "7b4226832783b66dd05154604eaf7b7a74154b41c655404afdb60517e4c6acea",
+          "size": 1992294400
+        },
+        {
+          "index": 25,
+          "name": "repository_runtime.sqlite3.part-00025-of-00034",
+          "sha256": "5249400cfd895da84508db60168b6ae0294101431e775717d2f9c5b73a9a8a0f",
+          "size": 1992294400
+        },
+        {
+          "index": 26,
+          "name": "repository_runtime.sqlite3.part-00026-of-00034",
+          "sha256": "4bd698c6a226dc374532e199b25bccb285c0e2f0bee67b4db8620854d234323a",
+          "size": 1992294400
+        },
+        {
+          "index": 27,
+          "name": "repository_runtime.sqlite3.part-00027-of-00034",
+          "sha256": "5668c0e1f3c2d96338cb29bda581e24f6cf4261466f5313b1759d203f5f10b98",
+          "size": 1992294400
+        },
+        {
+          "index": 28,
+          "name": "repository_runtime.sqlite3.part-00028-of-00034",
+          "sha256": "2ac72eebd81412fb94587c62fa3af5114b1cd648fca7d72aa9cf5f6eb32787cd",
+          "size": 1992294400
+        },
+        {
+          "index": 29,
+          "name": "repository_runtime.sqlite3.part-00029-of-00034",
+          "sha256": "bfcb0f948ad8768243e70a74844c1e2f9906e3d3dd330a637ec50daa64f6e763",
+          "size": 1992294400
+        },
+        {
+          "index": 30,
+          "name": "repository_runtime.sqlite3.part-00030-of-00034",
+          "sha256": "e92e17a64f10f5f7e18bb9c9b775f989925dc2b0ce4b334665455a348b63a831",
+          "size": 1992294400
+        },
+        {
+          "index": 31,
+          "name": "repository_runtime.sqlite3.part-00031-of-00034",
+          "sha256": "6eff602bd97286b342148304310d378f32cc55092a991d101ab85033d1a380af",
+          "size": 1992294400
+        },
+        {
+          "index": 32,
+          "name": "repository_runtime.sqlite3.part-00032-of-00034",
+          "sha256": "280c6fdee49d199a15a1626c28765c6ac0ad5646acf11f28069e3df4241a2131",
+          "size": 1992294400
+        },
+        {
+          "index": 33,
+          "name": "repository_runtime.sqlite3.part-00033-of-00034",
+          "sha256": "60a3029bac2dda25bfb8945d43e754dac0172cab6b0a9eb711f58458b872e2e6",
+          "size": 1992294400
+        },
+        {
+          "index": 34,
+          "name": "repository_runtime.sqlite3.part-00034-of-00034",
+          "sha256": "7f8650ac24dd56b25e221943579b27eb491411072a49fa1e99389d2f014ef842",
+          "size": 1124708352
+        }
+      ],
+      "path": "repository_runtime.sqlite3",
+      "sha256": "ab4e5881aa8c8d648962cea215ff8619dc1b68bdffdd7348335fc4e17a52f617",
+      "size": 66870423552
+    },
+    {
+      "asset": "tasks.parquet",
+      "mode": "single",
+      "path": "tasks.parquet",
+      "sha256": "ee6c3ada9fe6ca46c29096d6d58f46845aa95aed5500ed5937f289e2b35cd495",
+      "size": 222726471
+    }
+  ],
+  "release_tag": "evidence-agent-dataset-v1",
+  "repository": "YuanCXC/swe-evidence",
+  "schema_version": 1
+}

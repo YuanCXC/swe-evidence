@@ -1,0 +1,148 @@
+{
+  "contracts": {
+    "all_canonical_tasks_retained": true,
+    "base_dataset_required_after_export_for_execution": false,
+    "base_dataset_should_be_archived_for_reproducibility": true,
+    "benchmark_filter": "split == 'benchmark' and experiment_eligible == true",
+    "benchmark_for_training_or_tuning": false,
+    "build_db_required_after_export": false,
+    "experiment_excluded_tasks_physically_deleted": false,
+    "experiment_filter": "experiment_eligible == true",
+    "policy_evidence_is_self_contained_for_offline_training": true,
+    "runtime_repository_is_complete_for_online_retrieval": true,
+    "stable_evidence_id": true,
+    "strong_teacher_freeze_required_after_export": false,
+    "task_identity_preserved": true,
+    "train_cache_required_after_export": false,
+    "train_filter": "split == 'train' and experiment_eligible == true",
+    "validation_filter": "split == 'validation' and experiment_eligible == true"
+  },
+  "created_at": "2026-08-17T06:21:14.374716+00:00",
+  "dataset_name": "evidence_agent_dataset_v1",
+  "dataset_version": "1.0.0",
+  "elapsed_seconds": 7153.585,
+  "files": {
+    "policy_evidence.parquet": {
+      "bytes": 470383294,
+      "rows": 998682,
+      "sha256": "e2e446762aa08b621d0635e049be225916e19086c2658ef50080de89a4bc4a77"
+    },
+    "repository_runtime.sqlite3": {
+      "bytes": 66870423552,
+      "sha256": "ab4e5881aa8c8d648962cea215ff8619dc1b68bdffdd7348335fc4e17a52f617"
+    },
+    "tasks.parquet": {
+      "bytes": 222726471,
+      "rows": 20864,
+      "sha256": "ee6c3ada9fe6ca46c29096d6d58f46845aa95aed5500ed5937f289e2b35cd495"
+    }
+  },
+  "files_created": 4,
+  "final_audit": {
+    "error_count": 0,
+    "errors": [],
+    "policy_evidence_rows": 998682,
+    "runtime_counts": {
+      "evidence_units": 25496300,
+      "file_versions": 1027752,
+      "snapshot_file_memberships": 32092093,
+      "snapshots": 18527
+    },
+    "runtime_fts_tables": [
+      "policy_file_fts"
+    ],
+    "status": "PASS",
+    "task_rows": 20864
+  },
+  "integrity_audit_passed": true,
+  "policy_evidence": {
+    "columns": [
+      "evidence_id",
+      "file_version_id",
+      "repo",
+      "path",
+      "blob_oid",
+      "unit_type",
+      "symbol",
+      "qualified_name",
+      "start_line",
+      "end_line",
+      "parent_evidence_id",
+      "content",
+      "content_sha256",
+      "token_count",
+      "rendered_token_count",
+      "scoreable"
+    ],
+    "content_sha256_verified": true,
+    "content_source": "file_versions.payload_json.content sliced by evidence unit line range",
+    "referenced_evidence_id_count": 998682,
+    "resumed_existing_file": true,
+    "rows": 998682
+  },
+  "repository_runtime": {
+    "core_table_counts": {
+      "evidence_units": 25496300,
+      "file_versions": 1027752,
+      "snapshot_file_memberships": 32092093,
+      "snapshots": 18527
+    },
+    "fts": {
+      "clone": {
+        "mode": "sqlite_backup_api",
+        "source": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\.build\\retriever_v2_2_fts.sqlite3",
+        "source_size_bytes": 5204754432
+      },
+      "mode": "cloned_v2_10_fts5_sidecar",
+      "virtual_tables": {
+        "policy_file_fts": {
+          "rows": 951171,
+          "sql": "CREATE VIRTUAL TABLE policy_file_fts USING fts5(repo_token, path, content, content='')"
+        }
+      }
+    },
+    "integrity_check": "quick_check:ok",
+    "source_attach_mode": "absolute_path_read_only_by_contract"
+  },
+  "runtime_source_counts": {
+    "evidence_units": 25496300,
+    "file_versions": 1027752,
+    "snapshot_file_memberships": 32092093,
+    "snapshots": 18527
+  },
+  "script_version": "1.0.3",
+  "semantic_review_complete": true,
+  "source": {
+    "base_dataset_dir": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\unified_swe_dataset_v2_10",
+    "base_manifest": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\unified_swe_dataset_v2_10\\manifest_v2_10.json",
+    "base_manifest_sha256": "c30c69a67914c4bde26f4681ae40c7a0b0f9e6ba9ead7a9cb934ba6c4f086d9c",
+    "base_repository_corpus": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\unified_swe_dataset_v2_10\\repository_corpus_v2_10.parquet",
+    "base_repository_corpus_sha256": "7660e420c8fd19dea03217e1a72c3c4656a48b3b61275d5c94e74565322aba72",
+    "build_db_export_only": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\.build\\unified_swe_v1.sqlite3",
+    "derived_dataset_dir": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\unified_swe_dataset_v2_10_teacher_v1",
+    "derived_manifest": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\unified_swe_dataset_v2_10_teacher_v1\\manifest.json",
+    "derived_manifest_sha256": "88486f99776031a744a1671c1960ca65eec9093809cb67eeae5a4c0eef1a350b",
+    "fts_db_export_only": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\.build\\retriever_v2_2_fts.sqlite3",
+    "integrity_audit": "E:\\Code_Personal\\Subject\\evidence-agent\\data\\unified_swe_dataset_v2_10_teacher_v1\\integrity_audit.json",
+    "integrity_audit_sha256": "08fbfc39476e4724acff4d4997a8ff037ceac4f9e9ae67b827d6f0b844e41dba",
+    "source_files_mutated": false
+  },
+  "status": "FROZEN",
+  "task_counts": {
+    "benchmark": 2294,
+    "eligible_by_split": {
+      "benchmark": 2292,
+      "train": 18344,
+      "validation": 223
+    },
+    "eligible_total": 20859,
+    "excluded_by_reason": {
+      "POLICY_POSITIVE_UNSCOREABLE": 5
+    },
+    "excluded_total": 5,
+    "total": 20864,
+    "train": 18347,
+    "validation": 223
+  },
+  "training_ready": true
+}

@@ -71,10 +71,11 @@ Parquet 文件。
 1. 对小样本执行分卷和合并测试，确认红绿测试循环通过。
 2. 对真实 SQLite 生成分卷，并为 3 个数据文件生成 `release_manifest.json`。
 3. 运行 `verify-parts`，校验全部真实分卷及完整拼接字节流。
-4. 提交原始 `manifest.json`、发布清单、工具、测试和使用说明。
+4. 提交原始 `manifest.json`、发布清单、工具、测试和使用说明，并推送发布分支。
 5. 创建草稿 GitHub Release，上传 SQLite 分卷和两个完整 Parquet。
-6. 从 Release 下载附件后执行一次真实 SQLite 合并，并校验全部文件的 SHA-256。
-7. 推送发布分支并创建草稿 Pull Request。
+6. 使用本地分卷执行一次真实 SQLite 合并，并校验全部文件的 SHA-256。
+7. 对照发布清单检查远端附件的大小和 GitHub SHA-256 摘要。
+8. 发布 GitHub Release，并创建草稿 Pull Request。
 
 恢复流程如下：
 
