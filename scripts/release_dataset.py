@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_CHUNK_SIZE = 1_900 * 1024 * 1024
+DEFAULT_CHUNK_SIZE = 100 * 1024 * 1024
 GITHUB_RELEASE_ASSET_LIMIT = 2 * 1024 * 1024 * 1024
 BUFFER_SIZE = 8 * 1024 * 1024
 SQLITE_NAME = "repository_runtime.sqlite3"

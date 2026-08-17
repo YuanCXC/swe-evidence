@@ -1,7 +1,7 @@
 # evidence_agent_dataset_v1
 
 该数据集通过 GitHub Release 发布。只有约 62 GiB 的
-`repository_runtime.sqlite3` 被拆成 1,900 MiB 分卷；两个 Parquet
+`repository_runtime.sqlite3` 被拆成 100 MiB 分卷；两个 Parquet
 文件保持为完整附件。
 
 ## 文件布局
