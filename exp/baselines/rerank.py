@@ -67,17 +67,28 @@ class RerankCaller:
             "overlap_tokens": 0,
         }
         for attempt in range(self.max_retries + 1):
+            delay = 0.0
             try:
                 response = client.post("rerank", json=payload)
                 if response.status_code in {429, 500, 502, 503, 504}:
                     if attempt == self.max_retries:
                         response.raise_for_status()
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        delay = (
+                            float(retry_after)
+                            if retry_after and retry_after.replace(".", "", 1).isdigit()
+                            else 60.0
+                        )
+                    else:
+                        delay = min(2**attempt + random.random(), 30.0)
                 else:
                     break
             except httpx.TransportError:
                 if attempt == self.max_retries:
                     raise
-            time.sleep(min(2**attempt + random.random(), 30.0))
+                delay = min(2**attempt + random.random(), 30.0)
+            time.sleep(delay)
         response.raise_for_status()
         result = response.json()
         usage = result.get("usage") or (result.get("meta") or {}).get("tokens")
