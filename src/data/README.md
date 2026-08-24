@@ -21,8 +21,8 @@
 
 | 文件 | 作用 | 数据来源 |
 |---|---|---|
-| `__init__.py` | 导出在线安全的 `TaskReader`、`RuntimeRepository` 和 `PolicyEvidenceReader`。不导出离线监督接口。 | — |
-| `task_reader.py` | 读取 Issue、repo、snapshot、split 和实验资格等任务输入，并主动移除监督、轨迹和 Gold 字段。 | `tasks.parquet` |
+| `__init__.py` | 导出在线安全的 `TaskReader`、`RuntimeRepository`、`PolicyEvidenceReader` 和统一在线问题构造函数。不导出离线监督接口。 | — |
+| `task_reader.py` | 读取 Issue、repo、snapshot、split 和实验资格等任务输入，并主动移除监督、轨迹和 Gold 字段；`build_online_issue` 统一拼接 Problem Statement 与公开 hints。 | `tasks.parquet` |
 | `policy_evidence_reader.py` | 读取冻结 Policy states/actions 引用的 Evidence Unit 文本子集，供 Cross-Encoder 输入构造、状态级评价和消融使用。 | `policy_evidence.parquet` |
 | `runtime_repository.py` | 只读访问完整修复前仓库，查询 snapshot、文件版本、已有 Evidence Units、文件级 FTS 结果和结构上下文。 | `repository_runtime.sqlite3` |
 | `supervision_reader.py` | 读取 Gold Patch、Test Patch、七类 Evidence Obligation、OR-of-AND Witness、Policy states 和 Strong-Teacher 审计字段。只能用于训练、审计与离线评价。 | `tasks.parquet` |

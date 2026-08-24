@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import random
+import time
 from threading import Lock
 from typing import Any, Mapping, Sequence
 
 import httpx
 
+from exp.api_usage import record_api_usage
 from src.data import RuntimeRepository
 from src.retrieval.unit_retriever import retrieval_terms
 
@@ -24,6 +27,7 @@ class RerankCaller:
         api_base: str | None,
         api_keys: Sequence[str],
         timeout: float,
+        max_retries: int,
         max_chunks_per_doc: int,
         overlap_tokens: int,
     ) -> None:
@@ -38,6 +42,7 @@ class RerankCaller:
         ]
         self.max_chunks_per_doc = max_chunks_per_doc
         self.overlap_tokens = overlap_tokens
+        self.max_retries = max_retries
         self.call_count = 0
         self.pool_lock = Lock()
 
@@ -53,21 +58,34 @@ class RerankCaller:
         with self.pool_lock:
             client = self.clients[self.call_count % len(self.clients)]
             self.call_count += 1
-        response = client.post(
-            "rerank",
-            json={
-                "model": self.model_name,
-                "query": query,
-                "documents": list(documents),
-                "top_n": top_n,
-                "return_documents": False,
-                "max_chunks_per_doc": self.max_chunks_per_doc,
-                "overlap_tokens": self.overlap_tokens,
-            },
-        )
+        payload = {
+            "model": self.model_name,
+            "query": query,
+            "documents": list(documents),
+            "top_n": top_n,
+            "return_documents": False,
+            "max_chunks_per_doc": self.max_chunks_per_doc,
+            "overlap_tokens": self.overlap_tokens,
+        }
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = client.post("rerank", json=payload)
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    if attempt == self.max_retries:
+                        response.raise_for_status()
+                else:
+                    break
+            except httpx.TransportError:
+                if attempt == self.max_retries:
+                    raise
+            time.sleep(min(2**attempt + random.random(), 30.0))
         response.raise_for_status()
+        result = response.json()
+        record_api_usage(result.get("usage"))
+        if not isinstance(result.get("results"), list):
+            raise ValueError("Rerank API 响应缺少 results 数组")
         return sorted(
-            response.json()["results"],
+            result["results"],
             key=lambda item: (-float(item["relevance_score"]), int(item["index"])),
         )
 

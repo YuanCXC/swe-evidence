@@ -34,13 +34,36 @@ class RetrievalPlan:
     def from_mapping(cls, value: Mapping[str, Any]) -> RetrievalPlan:
         """从规划模型输出的 JSON 对象创建检索计划。"""
 
+        fields = (
+            "target_dimensions",
+            "queries",
+            "paths",
+            "symbols",
+            "retrieval_channels",
+        )
+        for field in fields:
+            if not isinstance(value.get(field), list):
+                raise ValueError(f"Planner 字段 {field} 必须是 JSON 数组")
+        dimensions = tuple(map(str, value["target_dimensions"]))
+        channels = tuple(map(str, value["retrieval_channels"]))
+        invalid_dimensions = set(dimensions) - set(EVIDENCE_DIMENSIONS)
+        invalid_channels = set(channels) - set(RETRIEVAL_CHANNELS)
+        if invalid_dimensions:
+            raise ValueError(f"Planner 输出了未知证据维度：{sorted(invalid_dimensions)}")
+        if invalid_channels:
+            raise ValueError(f"Planner 输出了未知检索通道：{sorted(invalid_channels)}")
+        if not channels:
+            raise ValueError("Planner 的 retrieval_channels 不能为空")
+        information_gap = value.get("information_gap")
+        if not isinstance(information_gap, str) or not information_gap.strip():
+            raise ValueError("Planner 的 information_gap 必须是非空字符串")
         return cls(
-            information_gap=str(value["information_gap"]),
-            target_dimensions=tuple(map(str, value["target_dimensions"])),
+            information_gap=information_gap.strip(),
+            target_dimensions=dimensions,
             queries=tuple(map(str, value["queries"])),
             paths=tuple(map(str, value["paths"])),
             symbols=tuple(map(str, value["symbols"])),
-            retrieval_channels=tuple(map(str, value["retrieval_channels"])),
+            retrieval_channels=channels,
         )
 
     def to_dict(self) -> dict[str, Any]:

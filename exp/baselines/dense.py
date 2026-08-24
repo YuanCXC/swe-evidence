@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from openai import OpenAI
 
+from exp.api_usage import record_api_usage
 from src.data import RuntimeRepository
 from src.evaluation import apply_budget
 
@@ -26,6 +27,7 @@ class DenseEncoder:
         api_base: str | None,
         api_keys: Sequence[str],
         timeout: float,
+        max_retries: int,
         batch_size: int,
         cache_path: Path | str,
     ) -> None:
@@ -35,7 +37,7 @@ class DenseEncoder:
                 api_key=api_key,
                 base_url=api_base,
                 timeout=timeout,
-                max_retries=0,
+                max_retries=max_retries,
             )
             for api_key in api_keys
         ]
@@ -81,6 +83,7 @@ class DenseEncoder:
                 input=list(texts[offset : offset + self.batch_size]),
                 encoding_format="float",
             )
+            record_api_usage(response.usage)
             vectors.extend(
                 np.asarray(item.embedding, dtype=np.float32)
                 for item in sorted(response.data, key=lambda item: item.index)
@@ -91,18 +94,25 @@ class DenseEncoder:
 
     def _document_vectors(
         self,
-        file_ids: Sequence[str],
-        documents: Sequence[str],
+        repository: RuntimeRepository,
+        files: Sequence[Mapping[str, Any]],
     ) -> np.ndarray:
+        file_ids = [str(item["file_version_id"]) for item in files]
         cached = self._read_cached_vectors(file_ids)
-        missing_indices = [
-            index for index, file_id in enumerate(file_ids) if file_id not in cached
+        missing_files = [
+            item for item in files if str(item["file_version_id"]) not in cached
         ]
-        if missing_indices:
-            encoded = self._embed([documents[index] for index in missing_indices])
+        if missing_files:
+            documents = []
+            for item in missing_files:
+                file_record = repository.get_file_version(str(item["file_version_id"]))
+                documents.append(
+                    f"文件路径：{item['path']}\n\n{file_record.get('content') or ''}"
+                )
+            encoded = self._embed(documents)
             additions = []
-            for index, vector in zip(missing_indices, encoded):
-                file_id = file_ids[index]
+            for item, vector in zip(missing_files, encoded):
+                file_id = str(item["file_version_id"])
                 cached[file_id] = vector
                 additions.append((file_id, vector.tobytes()))
             with self.cache_lock:
@@ -125,16 +135,9 @@ class DenseEncoder:
         """按查询与文件向量的余弦相似度返回文件排名。"""
 
         files = repository.list_snapshot_files(snapshot_id)
-        file_ids = [str(item["file_version_id"]) for item in files]
-        documents = []
-        for item in files:
-            file_record = repository.get_file_version(str(item["file_version_id"]))
-            documents.append(
-                f"文件路径：{item['path']}\n\n{file_record.get('content') or ''}"
-            )
 
         query_vector = self._embed([query])[0]
-        document_vectors = self._document_vectors(file_ids, documents)
+        document_vectors = self._document_vectors(repository, files)
         scores = document_vectors @ query_vector
 
         ranked_indices = sorted(

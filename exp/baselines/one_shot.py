@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from src.agents import RetrievalPlanner
+from src.data import build_online_issue
 from src.evaluation import apply_budget
 from src.retrieval import RepositoryRAG
 
@@ -30,7 +31,7 @@ class OneShotBaseline:
     def run(self, task: Mapping[str, Any]) -> dict[str, Any]:
         """从空 K 规划并检索一次，将 RAG 排名直接作为最终证据包。"""
 
-        issue = str(task["input"]["problem_statement"])
+        issue = build_online_issue(task["input"])
         plan = self.planner.plan(issue=issue, current_evidence=[])
         candidates = self.rag.retrieve(task, plan, limit=self.retrieval_limit)
         evidence = apply_budget(

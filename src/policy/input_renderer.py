@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from src.data import build_online_issue
+
 
 MODEL_MAX_LENGTH = 4096
 QUESTION_MAX_TOKENS = 2048
@@ -34,13 +36,7 @@ def render_metadata(record: Mapping[str, Any]) -> str:
 def build_question(task_input: Mapping[str, Any]) -> str:
     """按训练契约拼接 Problem Statement 与 hints。"""
 
-    pieces = [str(task_input.get("problem_statement") or "")]
-    hints = task_input.get("hints")
-    if isinstance(hints, str) and hints.strip():
-        pieces.append(hints)
-    elif isinstance(hints, Sequence) and not isinstance(hints, str):
-        pieces.extend(str(item) for item in hints if str(item).strip())
-    return "\n".join(piece for piece in pieces if piece.strip())
+    return build_online_issue(task_input)
 
 
 def encode_ids(tokenizer: Any, text: str, *, add_special_tokens: bool) -> list[int]:

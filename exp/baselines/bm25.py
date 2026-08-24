@@ -4,19 +4,15 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from src.data import RuntimeRepository
+from src.data import RuntimeRepository, build_online_issue
 from src.evaluation import apply_budget
 from src.retrieval.unit_retriever import retrieval_terms
 
 
 def task_query(task_input: Mapping[str, Any]) -> str:
-    pieces = [str(task_input.get("problem_statement") or "")]
-    hints = task_input.get("hints")
-    if isinstance(hints, str) and hints.strip():
-        pieces.append(hints)
-    elif isinstance(hints, list):
-        pieces.extend(str(item) for item in hints if str(item).strip())
-    return "\n".join(pieces)
+    """兼容已有 Baseline 调用的统一在线问题入口。"""
+
+    return build_online_issue(task_input)
 
 
 class BM25Baseline:

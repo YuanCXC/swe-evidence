@@ -15,6 +15,56 @@ SEMANTIC_DIMENSIONS = (
     "repair_scope",
     "validation_constraint",
 )
+SEMANTIC_JUDGE_PROMPT_VERSION = "2.0"
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    value = text.strip()
+    if value.startswith("```") and value.endswith("```"):
+        value = value.split("\n", maxsplit=1)[1].rsplit("```", maxsplit=1)[0]
+    payload = json.loads(value)
+    if not isinstance(payload, dict):
+        raise ValueError("语义 Judge 必须输出一个 JSON 对象")
+    return payload
+
+
+def _validate_judgment(result: Mapping[str, Any]) -> None:
+    verdicts = {"sufficient", "partial", "insufficient"}
+    if result.get("sufficiency_verdict") not in verdicts:
+        raise ValueError("语义 Judge 的 sufficiency_verdict 非法")
+    categorical_fields = {
+        "causal_correctness": {"correct", "partial", "incorrect", "uncertain"},
+        "execution_relevance": {"relevant", "partial", "irrelevant", "uncertain"},
+        "repair_support": verdicts,
+    }
+    for field, choices in categorical_fields.items():
+        if result.get(field) not in choices:
+            raise ValueError(f"语义 Judge 的 {field} 非法")
+    dimensions = result.get("dimensions")
+    if not isinstance(dimensions, Mapping):
+        raise ValueError("语义 Judge 的 dimensions 必须是 JSON 对象")
+    for name in SEMANTIC_DIMENSIONS:
+        dimension = dimensions.get(name)
+        if not isinstance(dimension, Mapping):
+            raise ValueError(f"语义 Judge 缺少维度 {name}")
+        if dimension.get("coverage") not in {"sufficient", "partial", "none"}:
+            raise ValueError(f"语义 Judge 维度 {name} 的 coverage 非法")
+        if not isinstance(dimension.get("applicable"), bool) or not isinstance(
+            dimension.get("critical"), bool
+        ):
+            raise ValueError(f"语义 Judge 维度 {name} 的布尔字段非法")
+    confidence = result.get("confidence")
+    if not isinstance(confidence, (int, float)) or not 0.0 <= confidence <= 1.0:
+        raise ValueError("语义 Judge 的 confidence 必须位于 [0, 1]")
+    for field in (
+        "useful_evidence_ids",
+        "irrelevant_evidence_ids",
+        "redundant_evidence_ids",
+        "misleading_evidence_ids",
+        "missing_requirements",
+    ):
+        if not isinstance(result.get(field), list):
+            raise ValueError(f"语义 Judge 字段 {field} 必须是 JSON 数组")
 
 
 def render_evidence_package(evidence_package: Sequence[Mapping[str, Any]]) -> str:
@@ -104,6 +154,7 @@ def judge_evidence_package(
         gold_patch=gold_patch,
         test_patch=test_patch,
     )
-    result = json.loads(call_model(prompt))
+    result = _parse_json_object(call_model(prompt))
+    _validate_judgment(result)
     result["evidence_count"] = len(evidence_package)
     return result

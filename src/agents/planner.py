@@ -8,13 +8,35 @@ from typing import Any, Callable, Mapping, Sequence
 from .retrieval_plan import EVIDENCE_DIMENSIONS, RETRIEVAL_CHANNELS, RetrievalPlan
 
 
+PLANNER_PROMPT_VERSION = "2.0"
+
+
+def _state_body_ids(
+    current_evidence: Sequence[Mapping[str, Any]],
+    body_token_budget: int,
+) -> set[str]:
+    """在预算内优先保留最近获取 Evidence 的正文。"""
+
+    selected: set[str] = set()
+    remaining = body_token_budget
+    for unit in reversed(current_evidence):
+        token_count = int(unit.get("rendered_token_count") or 0)
+        if token_count <= remaining:
+            selected.add(str(unit["evidence_id"]))
+            remaining -= token_count
+    return selected
+
+
 def render_current_evidence(
     current_evidence: Sequence[Mapping[str, Any]],
+    *,
+    body_token_budget: int,
 ) -> str:
-    """把已经获取的 Evidence 渲染为规划模型可见状态。"""
+    """渲染全量元数据，并仅为预算内 Evidence 附带正文。"""
 
     if not current_evidence:
         return "[EMPTY]"
+    body_ids = _state_body_ids(current_evidence, body_token_budget)
     return "\n\n---\n\n".join(
         "\n".join(
             (
@@ -22,7 +44,11 @@ def render_current_evidence(
                 f"位置：{unit['path']}:{unit['start_line']}-{unit['end_line']}",
                 f"类型：{unit['unit_type']}",
                 f"符号：{unit.get('qualified_name') or unit.get('symbol') or ''}",
-                str(unit["content"]),
+                (
+                    str(unit["content"])
+                    if str(unit["evidence_id"]) in body_ids
+                    else "[正文因 Planner 上下文预算省略]"
+                ),
             )
         )
         for unit in current_evidence
@@ -34,12 +60,16 @@ def build_planner_prompt(
     issue: str,
     current_evidence: Sequence[Mapping[str, Any]],
     retrieval_channels: Sequence[str] = RETRIEVAL_CHANNELS,
+    evidence_body_token_budget: int = 8192,
 ) -> str:
     """构造只负责检索规划、不选择具体 Evidence 的提示。"""
 
     dimensions = ", ".join(EVIDENCE_DIMENSIONS)
     channels = ", ".join(retrieval_channels)
-    state = render_current_evidence(current_evidence)
+    state = render_current_evidence(
+        current_evidence,
+        body_token_budget=evidence_body_token_budget,
+    )
     return f"""你是软件仓库 Evidence Agent 的检索规划器。你的任务是根据 Issue 和当前已经获取的 Evidence，决定下一轮应该通过 RAG 检索什么内容。
 
 职责边界：
@@ -78,9 +108,11 @@ class RetrievalPlanner:
         call_model: Callable[[str], str | Mapping[str, Any]],
         *,
         retrieval_channels: Sequence[str] = RETRIEVAL_CHANNELS,
+        evidence_body_token_budget: int = 8192,
     ) -> None:
         self.call_model = call_model
         self.retrieval_channels = tuple(map(str, retrieval_channels))
+        self.evidence_body_token_budget = evidence_body_token_budget
 
     def plan(
         self,
@@ -94,7 +126,16 @@ class RetrievalPlanner:
             issue=issue,
             current_evidence=current_evidence,
             retrieval_channels=self.retrieval_channels,
+            evidence_body_token_budget=self.evidence_body_token_budget,
         )
         result = self.call_model(prompt)
-        payload = json.loads(result) if isinstance(result, str) else result
+        if isinstance(result, str):
+            text = result.strip()
+            if text.startswith("```") and text.endswith("```"):
+                text = text.split("\n", maxsplit=1)[1].rsplit("```", maxsplit=1)[0]
+            payload = json.loads(text)
+        else:
+            payload = result
+        if not isinstance(payload, Mapping):
+            raise ValueError("Planner 必须输出一个 JSON 对象")
         return RetrievalPlan.from_mapping(payload)

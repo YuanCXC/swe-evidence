@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 import pyarrow.dataset as ds
 
@@ -20,6 +20,18 @@ ONLINE_COLUMNS = (
     "experiment_eligible",
     "split",
 )
+
+
+def build_online_issue(task_input: Mapping[str, Any]) -> str:
+    """统一拼接在线阶段允许使用的 Problem Statement 与公开 hints。"""
+
+    pieces = [str(task_input.get("problem_statement") or "")]
+    hints = task_input.get("hints")
+    if isinstance(hints, str) and hints.strip():
+        pieces.append(hints)
+    elif isinstance(hints, Sequence):
+        pieces.extend(str(item) for item in hints if str(item).strip())
+    return "\n".join(piece for piece in pieces if piece.strip())
 
 
 def online_task_view(row: Mapping[str, Any]) -> dict[str, Any]:

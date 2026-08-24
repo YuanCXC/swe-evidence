@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from src.agents import AgentState, RetrievalPlanner
+from src.data import build_online_issue
 from src.retrieval import RepositoryRAG
 
 
@@ -52,7 +53,7 @@ class FixedIterativeBaseline:
     def run(self, task: Mapping[str, Any]) -> dict[str, Any]:
         """每轮选择候选账本中检索分数最高且满足预算的 Single。"""
 
-        issue = str(task["input"]["problem_statement"])
+        issue = build_online_issue(task["input"])
         state = AgentState(
             task_id=str(task["task_id"]),
             snapshot_id=str(task["snapshot_id"]),

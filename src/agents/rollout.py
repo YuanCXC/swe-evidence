@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from src.data import build_online_issue
 from src.policy import ActionBuilder, EvidencePolicy
 from src.retrieval import RepositoryRAG
 
@@ -65,7 +66,7 @@ class EvidenceAgent:
     def run(self, task: Mapping[str, Any]) -> dict[str, Any]:
         """从空 K 开始运行，直到模型 STOP 或系统预算终止。"""
 
-        issue = str(task["input"]["problem_statement"])
+        issue = build_online_issue(task["input"])
         state = AgentState(
             task_id=str(task["task_id"]),
             snapshot_id=str(task["snapshot_id"]),

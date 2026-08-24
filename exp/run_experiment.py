@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from exp.ablations import ABLATION_VARIANTS, build_ablation  # noqa: E402
+from exp.api_usage import capture_api_usage, record_api_usage  # noqa: E402
 from exp.baselines import (  # noqa: E402
     BM25Baseline,
     DenseBaseline,
@@ -43,15 +44,25 @@ from exp.baselines.external import (  # noqa: E402
     SweRankOutputStore,
 )
 from exp.ours import build_ours  # noqa: E402
+from exp.provenance import (  # noqa: E402
+    artifact_identity,
+    code_identity,
+    ensure_manifest,
+    manifest_path,
+)
 from src.agents import RETRIEVAL_CHANNELS, RetrievalPlanner  # noqa: E402
-from src.data import RuntimeRepository, TaskReader  # noqa: E402
+from src.agents.planner import PLANNER_PROMPT_VERSION  # noqa: E402
+from src.data import RuntimeRepository, TaskReader, build_online_issue  # noqa: E402
 from src.data.supervision_reader import SupervisionReader  # noqa: E402
 from src.evaluation.aggregation import aggregate_rows  # noqa: E402
 from src.evaluation.cost_metrics import auc_sufficiency_cost  # noqa: E402
 from src.evaluation.interaction_metrics import evaluate_interactions  # noqa: E402
 from src.evaluation.localization_metrics import localization_metrics  # noqa: E402
 from src.evaluation.retrieval_metrics import retrieval_metrics  # noqa: E402
-from src.evaluation.semantic_judge import judge_evidence_package  # noqa: E402
+from src.evaluation.semantic_judge import (  # noqa: E402
+    SEMANTIC_JUDGE_PROMPT_VERSION,
+    judge_evidence_package,
+)
 from src.evaluation.semantic_metrics import (  # noqa: E402
     aggregate_semantic_judgments,
 )
@@ -147,6 +158,7 @@ class OpenAICompatibleCaller:
         api_base: str | None,
         api_keys: Sequence[str],
         timeout: float,
+        max_retries: int,
         extra_body: Mapping[str, Any],
     ) -> None:
         self.model = model
@@ -155,7 +167,7 @@ class OpenAICompatibleCaller:
                 api_key=api_key,
                 base_url=api_base,
                 timeout=timeout,
-                max_retries=0,
+                max_retries=max_retries,
             )
             for api_key in api_keys
         ]
@@ -173,6 +185,7 @@ class OpenAICompatibleCaller:
             temperature=0.0,
             extra_body=self.extra_body,
         )
+        record_api_usage(response.usage)
         return str(response.choices[0].message.content)
 
 
@@ -222,6 +235,22 @@ def completed_task_ids(path: Path) -> set[str]:
     return {
         str(row["task_id"]) for row in read_jsonl(path) if row.get("status") == "ok"
     }
+
+
+def validate_result_manifest(path: Path) -> None:
+    """核对显式实验输入中的每条结果都属于同一个运行配置。"""
+
+    sidecar = manifest_path(path)
+    if not sidecar.exists():
+        raise ValueError(f"正式汇总输入缺少运行 manifest：{path}")
+    expected = str(json.loads(sidecar.read_text(encoding="utf-8"))["run_config_hash"])
+    mismatched = sum(
+        1
+        for row in read_jsonl(path)
+        if row.get("status") == "ok" and str(row.get("run_config_hash")) != expected
+    )
+    if mismatched:
+        raise ValueError(f"{path} 中有 {mismatched} 条结果不属于其运行 manifest")
 
 
 def file_label(value: str) -> str:
@@ -436,6 +465,7 @@ def build_planner(args: argparse.Namespace, *, use_structure: bool = True) -> An
     )
     args.active_model = model
     args.active_api_pool_size = len(api_keys)
+    args.active_api_base = api_base
     channels = (
         RETRIEVAL_CHANNELS
         if use_structure
@@ -446,9 +476,14 @@ def build_planner(args: argparse.Namespace, *, use_structure: bool = True) -> An
         api_base=api_base,
         api_keys=api_keys,
         timeout=args.api_timeout,
+        max_retries=args.api_max_retries,
         extra_body=API_PROFILES[args.api_profile]["non_thinking_body"],
     )
-    return RetrievalPlanner(caller, retrieval_channels=channels)
+    return RetrievalPlanner(
+        caller,
+        retrieval_channels=channels,
+        evidence_body_token_budget=args.planner_evidence_body_token_budget,
+    )
 
 
 def build_method(
@@ -571,6 +606,7 @@ def build_shared_resources(
         )
         args.active_dense_model = model
         args.active_api_pool_size = len(api_keys)
+        args.active_api_base = api_base
         return (
             None,
             None,
@@ -579,6 +615,7 @@ def build_shared_resources(
                 api_base=api_base,
                 api_keys=api_keys,
                 timeout=args.api_timeout,
+                max_retries=args.api_max_retries,
                 batch_size=args.dense_batch_size,
                 cache_path=dense_cache_path(args),
             ),
@@ -593,6 +630,7 @@ def build_shared_resources(
         )
         args.active_rerank_model = model
         args.active_api_pool_size = len(api_keys)
+        args.active_api_base = api_base
         return (
             None,
             None,
@@ -602,6 +640,7 @@ def build_shared_resources(
                 api_base=api_base,
                 api_keys=api_keys,
                 timeout=args.api_timeout,
+                max_retries=args.api_max_retries,
                 max_chunks_per_doc=args.rerank_max_chunks_per_doc,
                 overlap_tokens=args.rerank_overlap_tokens,
             ),
@@ -656,6 +695,60 @@ def build_shared_resources(
     )
 
 
+def build_run_config(
+    args: argparse.Namespace,
+    *,
+    external_path: Path | None,
+) -> dict[str, Any]:
+    """构造会影响逐任务实验结果的完整冻结配置。"""
+
+    config: dict[str, Any] = {
+        "method": args.method,
+        "split": args.split,
+        "code": code_identity(PROJECT_ROOT, ("src", "exp")),
+        "tasks": artifact_identity(args.tasks),
+        "runtime": artifact_identity(args.runtime),
+        "api": {
+            "profile": args.api_profile if args.method in API_METHODS else None,
+            "base_url": getattr(args, "active_api_base", None),
+            "planner_model": getattr(args, "active_model", None),
+            "dense_model": getattr(args, "active_dense_model", None),
+            "rerank_model": getattr(args, "active_rerank_model", None),
+            "thinking_mode": "disabled",
+            "max_retries": args.api_max_retries,
+        },
+        "prompt_versions": {
+            "planner": PLANNER_PROMPT_VERSION,
+            "policy_input": "1.0",
+        },
+        "parameters": {
+            "evidence_token_budget": args.evidence_token_budget,
+            "evidence_unit_budget": args.evidence_unit_budget,
+            "retrieval_limit": args.retrieval_limit,
+            "file_limit": args.file_limit,
+            "fixed_steps": args.fixed_steps,
+            "pair_limit": args.pair_limit,
+            "planner_evidence_body_token_budget": (
+                args.planner_evidence_body_token_budget
+            ),
+            "dense_batch_size": args.dense_batch_size,
+            "hybrid_candidate_file_limit": args.hybrid_candidate_file_limit,
+            "rrf_rank_constant": args.rrf_rank_constant,
+            "rerank_candidate_file_limit": args.rerank_candidate_file_limit,
+            "rerank_max_chunks_per_doc": args.rerank_max_chunks_per_doc,
+            "rerank_overlap_tokens": args.rerank_overlap_tokens,
+            "swerank_top_k": args.swerank_top_k,
+            "agentless_stage": args.agentless_stage,
+            "locagent_level": args.locagent_level,
+        },
+    }
+    if args.checkpoint:
+        config["checkpoint"] = artifact_identity(args.checkpoint)
+    if external_path:
+        config["external_output"] = artifact_identity(external_path)
+    return config
+
+
 def run_experiment(args: argparse.Namespace) -> None:
     """运行一个方法，并将每个任务的轨迹即时写入 JSONL。"""
 
@@ -683,6 +776,12 @@ def run_experiment(args: argparse.Namespace) -> None:
         rerank_caller,
         external_outputs,
     ) = build_shared_resources(args)
+    run_manifest = ensure_manifest(
+        output,
+        build_run_config(args, external_path=external_path),
+    )
+    run_config_hash = str(run_manifest["run_config_hash"])
+    code_record = run_manifest["config"]["code"]
     completed = completed_task_ids(output)
     if args.method in EXTERNAL_METHODS:
         selected_tasks = [
@@ -711,17 +810,21 @@ def run_experiment(args: argparse.Namespace) -> None:
         return
 
     def run_task(task: Mapping[str, Any]) -> dict[str, Any]:
-        with RuntimeRepository(args.runtime) as repository:
-            method = build_method(
-                args,
-                repository,
-                planner=planner,
-                policy=policy,
-                dense_encoder=dense_encoder,
-                rerank_caller=rerank_caller,
-                external_outputs=external_outputs,
-            )
-            return method.run(task)
+        with capture_api_usage() as api_usage:
+            with RuntimeRepository(args.runtime) as repository:
+                method = build_method(
+                    args,
+                    repository,
+                    planner=planner,
+                    policy=policy,
+                    dense_encoder=dense_encoder,
+                    rerank_caller=rerank_caller,
+                    external_outputs=external_outputs,
+                )
+                result = method.run(task)
+        if api_usage["api_calls"]:
+            result.update(api_usage)
+        return result
 
     succeeded = 0
     failed = 0
@@ -747,6 +850,9 @@ def run_experiment(args: argparse.Namespace) -> None:
                         "run_name": run_name,
                         "method": args.method,
                         "split": args.split,
+                        "run_config_hash": run_config_hash,
+                        "git_commit": str(code_record["git_commit"]),
+                        "code_sha256": str(code_record["code_sha256"]),
                         "api_profile": args.api_profile
                         if args.method in API_METHODS
                         else None,
@@ -781,6 +887,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                         "problem_statement": str(
                             task["input"]["problem_statement"]
                         ),
+                        "online_issue": build_online_issue(task["input"]),
                         **result,
                     },
                 )
@@ -793,6 +900,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                         "run_name": run_name,
                         "method": args.method,
                         "split": args.split,
+                        "run_config_hash": run_config_hash,
                         "task_id": task_id,
                         "error": f"{type(error).__name__}: {error}",
                     },
@@ -848,6 +956,24 @@ def run_judge(args: argparse.Namespace) -> None:
     )
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    args.active_api_base = api_base
+    judge_manifest = ensure_manifest(
+        output,
+        {
+            "mode": "semantic_judge",
+            "code": code_identity(PROJECT_ROOT, ("src", "exp")),
+            "input": artifact_identity(input_path),
+            "tasks": artifact_identity(args.tasks),
+            "api": {
+                "profile": args.api_profile,
+                "base_url": api_base,
+                "model": model,
+                "thinking_mode": "disabled",
+                "max_retries": args.api_max_retries,
+            },
+            "prompt_version": SEMANTIC_JUDGE_PROMPT_VERSION,
+        },
+    )
     raw = latest_successful_records([input_path])
     completed = completed_task_ids(output)
     pending = [row for row in raw.values() if str(row["task_id"]) not in completed]
@@ -861,19 +987,23 @@ def run_judge(args: argparse.Namespace) -> None:
         api_base=api_base,
         api_keys=api_keys,
         timeout=args.api_timeout,
+        max_retries=args.api_max_retries,
         extra_body=API_PROFILES[args.api_profile]["non_thinking_body"],
     )
 
     def judge_task(row: Mapping[str, Any]) -> dict[str, Any]:
         task_id = str(row["task_id"])
         reference = references[task_id]
-        return judge_evidence_package(
-            caller,
-            issue=str(row["problem_statement"]),
-            evidence_package=row["evidence_package"],
-            gold_patch=str(reference["gold_patch"]),
-            test_patch=str(reference["test_patch"]),
-        )
+        with capture_api_usage() as api_usage:
+            judgment = judge_evidence_package(
+                caller,
+                issue=str(row.get("online_issue") or row["problem_statement"]),
+                evidence_package=row["evidence_package"],
+                gold_patch=str(reference["gold_patch"]),
+                test_patch=str(reference["test_patch"]),
+            )
+        judgment.update(api_usage)
+        return judgment
 
     succeeded = 0
     failed = 0
@@ -900,6 +1030,7 @@ def run_judge(args: argparse.Namespace) -> None:
                         "api_pool_size": len(api_keys),
                         "concurrency": args.concurrency,
                         "thinking_mode": "disabled",
+                        "run_config_hash": str(judge_manifest["run_config_hash"]),
                         "task_id": task_id,
                         "case_id": f"{row['method']}:{task_id}",
                         **judgment,
@@ -914,6 +1045,7 @@ def run_judge(args: argparse.Namespace) -> None:
                         "run_name": str(row.get("run_name") or row["method"]),
                         "method": str(row["method"]),
                         "split": str(row["split"]),
+                        "run_config_hash": str(judge_manifest["run_config_hash"]),
                         "task_id": task_id,
                         "error": f"{type(error).__name__}: {error}",
                     },
@@ -1062,13 +1194,23 @@ def task_metrics(
 def run_aggregate(args: argparse.Namespace) -> None:
     """汇总目录中的原始结果和可选语义 Judge 结果。"""
 
-    input_dir = Path(args.input_dir).resolve()
-    raw_paths = sorted(
-        path
-        for path in input_dir.glob("*.jsonl")
-        if not path.name.endswith(".judgments.jsonl")
-    )
+    if args.inputs:
+        raw_paths = [Path(path).resolve() for path in args.inputs]
+        input_dir = raw_paths[0].parent
+        for path in raw_paths:
+            validate_result_manifest(path)
+    else:
+        input_dir = Path(args.input_dir).resolve()
+        raw_paths = sorted(
+            path
+            for path in input_dir.glob("*.jsonl")
+            if not path.name.endswith(".judgments.jsonl")
+        )
+    if not raw_paths:
+        raise ValueError("没有指定可汇总的实验结果 JSONL")
     raw = latest_successful_records(raw_paths)
+    if not raw:
+        raise ValueError("指定的实验结果中没有成功任务")
     run_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in raw.values():
         run_groups[
@@ -1086,11 +1228,46 @@ def run_aggregate(args: argparse.Namespace) -> None:
             if key[2] == split
         ]
         common_task_ids[split] = set.intersection(*task_sets)
+    if args.expected_task_count is not None:
+        mismatches = {
+            split: len(task_ids)
+            for split, task_ids in common_task_ids.items()
+            if len(task_ids) != args.expected_task_count
+        }
+        if mismatches:
+            raise ValueError(
+                f"共同任务数量与 --expected-task-count 不一致：{mismatches}"
+            )
     comparable_rows = [
         row
         for row in raw.values()
         if str(row["task_id"]) in common_task_ids[str(row["split"])]
     ]
+    external_rows = [
+        row for row in comparable_rows if str(row["method"]) in EXTERNAL_METHODS
+    ]
+    if args.require_external_snapshot_verified:
+        unverified = [
+            str(row["task_id"])
+            for row in external_rows
+            if not bool(row.get("snapshot_verified"))
+        ]
+        if unverified:
+            raise ValueError(
+                f"外部方法存在 {len(unverified)} 个未验证快照任务，拒绝生成主表"
+            )
+    if args.min_external_mapping_rate is not None:
+        low_mapping = [
+            str(row["task_id"])
+            for row in external_rows
+            if float(row.get("external_mapping_rate") or 0.0)
+            < args.min_external_mapping_rate
+        ]
+        if low_mapping:
+            raise ValueError(
+                f"外部方法存在 {len(low_mapping)} 个任务的映射率低于 "
+                f"{args.min_external_mapping_rate:.3f}"
+            )
     task_ids = {str(row["task_id"]) for row in comparable_rows}
     splits = {str(row["split"]) for row in raw.values()}
     references = load_references(args.tasks, task_ids, splits)
@@ -1184,7 +1361,16 @@ def run_aggregate(args: argparse.Namespace) -> None:
             summary["sufficiency_token_auc"] = auc
             summary["sufficiency_token_curve"] = curve_points
 
-    judgment_paths = sorted(input_dir.glob("*.judgments.jsonl"))
+    judgment_paths = (
+        [Path(path).resolve() for path in args.judgments]
+        if args.judgments
+        else sorted(input_dir.glob("*.judgments.jsonl"))
+        if not args.inputs
+        else []
+    )
+    if args.judgments:
+        for path in judgment_paths:
+            validate_result_manifest(path)
     judgments = latest_successful_records(judgment_paths)
     judgment_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in judgments.values():
@@ -1255,6 +1441,12 @@ def add_api_arguments(parser: argparse.ArgumentParser) -> None:
         help="覆盖 Profile 对应的 API Key 环境变量名",
     )
     parser.add_argument("--api-timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--api-max-retries",
+        type=int,
+        default=3,
+        help="429、5xx 和网络错误的最大重试次数",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1278,6 +1470,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--file-limit", type=int, default=32)
     run.add_argument("--fixed-steps", type=int, default=10)
     run.add_argument("--pair-limit", type=int, default=8)
+    run.add_argument(
+        "--planner-evidence-body-token-budget",
+        type=int,
+        default=8192,
+        help="Planner 可见的当前 Evidence 正文预算；元数据始终全量保留",
+    )
     run.add_argument(
         "--dense-model",
         help="覆盖 .env 中的 EMBEDDING_MODEL",
@@ -1339,7 +1537,39 @@ def build_parser() -> argparse.ArgumentParser:
     judge.set_defaults(handler=run_judge)
 
     aggregate = commands.add_parser("aggregate", help="汇总实验指标")
-    aggregate.add_argument("--input-dir", type=Path, required=True)
+    aggregate_source = aggregate.add_mutually_exclusive_group(required=True)
+    aggregate_source.add_argument(
+        "--inputs",
+        type=Path,
+        nargs="+",
+        help="正式实验显式指定需要比较的原始结果 JSONL",
+    )
+    aggregate_source.add_argument(
+        "--input-dir",
+        type=Path,
+        help="兼容模式：扫描目录中的全部原始结果 JSONL",
+    )
+    aggregate.add_argument(
+        "--judgments",
+        type=Path,
+        nargs="*",
+        help="显式指定与 --inputs 对应的语义 Judge JSONL",
+    )
+    aggregate.add_argument(
+        "--expected-task-count",
+        type=int,
+        help="要求每个 split 的共同任务交集严格等于该数量",
+    )
+    aggregate.add_argument(
+        "--require-external-snapshot-verified",
+        action="store_true",
+        help="拒绝包含未核对 base_commit 的外部方法结果",
+    )
+    aggregate.add_argument(
+        "--min-external-mapping-rate",
+        type=float,
+        help="拒绝任何单任务映射率低于该阈值的外部方法结果",
+    )
     aggregate.add_argument("--output", type=Path)
     aggregate.add_argument("--tasks", type=Path, default=DEFAULT_TASKS)
     aggregate.set_defaults(handler=run_aggregate)
@@ -1349,6 +1579,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     args = build_parser().parse_args()
+    if hasattr(args, "api_max_retries") and args.api_max_retries < 0:
+        raise ValueError("--api-max-retries 不能小于 0")
+    if (
+        hasattr(args, "planner_evidence_body_token_budget")
+        and args.planner_evidence_body_token_budget < 0
+    ):
+        raise ValueError("--planner-evidence-body-token-budget 不能小于 0")
+    if (
+        getattr(args, "min_external_mapping_rate", None) is not None
+        and not 0.0 <= args.min_external_mapping_rate <= 1.0
+    ):
+        raise ValueError("--min-external-mapping-rate 必须位于 [0, 1]")
+    if (
+        getattr(args, "expected_task_count", None) is not None
+        and args.expected_task_count <= 0
+    ):
+        raise ValueError("--expected-task-count 必须大于 0")
     args.handler(args)
     return 0
 

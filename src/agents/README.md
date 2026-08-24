@@ -2,8 +2,8 @@
 
 本目录实现单 Agent 的在线轨迹控制。Agent 的职责是决定“下一轮该检索什么”，不是直接挑选具体证据。
 
-- 当 K 为空时，根据 Issue 生成首轮 `RetrievalPlan` 并调用 RAG。
-- 当 K 非空时，根据 Issue 与当前 K 规划新的检索内容。
+- 当 K 为空时，根据 Problem Statement 与公开 hints 生成首轮 `RetrievalPlan` 并调用 RAG。
+- 当 K 非空时，根据统一在线问题与当前 K 规划新的检索内容。
 - 每轮把全部返回候选写入 `retrieved_ids` 和候选账本，后续 RAG 不再返回这些证据。
 - 未被选中的历史候选保留在账本中，Policy 后续仍可选择，但它们不会被重复检索。
 - 训练好的 Evidence Policy 从本轮候选动作中选择 `Single`、`Pair` 或 `STOP`。
@@ -18,6 +18,8 @@
 | `state.py` | 保存 K、历史检索 ID、候选账本、本轮候选、预算和终止状态。 |
 | `rollout.py` | 执行 `Plan → RAG → Policy → Update` 完整循环。 |
 | `README.md` | 说明 Agent 边界、状态和运行方式。 |
+
+Planner 始终接收 K 中全部 Evidence 的 ID、路径、类型、符号和行号元数据。正文使用独立上下文预算，默认优先保留最近获取 Evidence 的 8192 Token；超出预算的正文显示为省略标记，避免长轨迹无限扩大提示。该预算由实验入口的 `--planner-evidence-body-token-budget` 配置。
 
 ## Agent 模式
 
