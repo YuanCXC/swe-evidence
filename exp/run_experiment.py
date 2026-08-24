@@ -798,7 +798,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                     external_outputs=external_outputs,
                 )
                 result = method.run(task)
-        if api_usage["api_calls"]:
+        if api_usage["api_calls"] or api_usage["index_api_calls"]:
             result.update(api_usage)
         return result
 
@@ -1133,6 +1133,10 @@ def task_metrics(
         "api_completion_tokens",
         "api_total_tokens",
         "api_calls",
+        "index_api_prompt_tokens",
+        "index_api_completion_tokens",
+        "index_api_total_tokens",
+        "index_api_calls",
         "external_agent_iterations",
         "external_tool_calls",
         "external_elapsed_seconds",
@@ -1299,6 +1303,10 @@ def run_aggregate(args: argparse.Namespace) -> None:
             "api_completion_tokens",
             "api_total_tokens",
             "api_calls",
+            "index_api_prompt_tokens",
+            "index_api_completion_tokens",
+            "index_api_total_tokens",
+            "index_api_calls",
             "external_agent_iterations",
             "external_tool_calls",
             "external_elapsed_seconds",

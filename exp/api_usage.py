@@ -21,8 +21,13 @@ def _usage_value(usage: Any, *names: str) -> int:
     return 0
 
 
-def record_api_usage(usage: Any = None, *, calls: int = 1) -> None:
-    """把一次 API 调用归入当前任务，不跨并发任务共享计数。"""
+def record_api_usage(
+    usage: Any = None,
+    *,
+    calls: int = 1,
+    scope: str = "api",
+) -> None:
+    """把一次 API 调用按在线推理或离线索引归入当前任务。"""
 
     bucket = _CURRENT_USAGE.get()
     if bucket is None:
@@ -32,10 +37,10 @@ def record_api_usage(usage: Any = None, *, calls: int = 1) -> None:
         _usage_value(usage, "completion_tokens", "output_tokens") if usage else 0
     )
     total = _usage_value(usage, "total_tokens") if usage else 0
-    bucket["api_prompt_tokens"] += prompt
-    bucket["api_completion_tokens"] += completion
-    bucket["api_total_tokens"] += total or prompt + completion
-    bucket["api_calls"] += calls
+    bucket[f"{scope}_prompt_tokens"] += prompt
+    bucket[f"{scope}_completion_tokens"] += completion
+    bucket[f"{scope}_total_tokens"] += total or prompt + completion
+    bucket[f"{scope}_calls"] += calls
 
 
 @contextmanager
@@ -47,6 +52,10 @@ def capture_api_usage() -> Iterator[dict[str, int]]:
         "api_completion_tokens": 0,
         "api_total_tokens": 0,
         "api_calls": 0,
+        "index_api_prompt_tokens": 0,
+        "index_api_completion_tokens": 0,
+        "index_api_total_tokens": 0,
+        "index_api_calls": 0,
     }
     token = _CURRENT_USAGE.set(bucket)
     try:

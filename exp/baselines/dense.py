@@ -79,7 +79,7 @@ class DenseEncoder:
             for file_version_id, vectors in grouped.items()
         }
 
-    def _embed(self, texts: Sequence[str]) -> np.ndarray:
+    def _embed(self, texts: Sequence[str], *, usage_scope: str = "api") -> np.ndarray:
         vectors = []
         for offset in range(0, len(texts), self.batch_size):
             with self.pool_lock:
@@ -90,7 +90,7 @@ class DenseEncoder:
                 input=list(texts[offset : offset + self.batch_size]),
                 encoding_format="float",
             )
-            record_api_usage(response.usage)
+            record_api_usage(response.usage, scope=usage_scope)
             vectors.extend(
                 np.asarray(item.embedding, dtype=np.float32)
                 for item in sorted(response.data, key=lambda item: item.index)
@@ -122,7 +122,10 @@ class DenseEncoder:
                     (file_id, chunk_index, text)
                     for chunk_index, text in enumerate(chunks)
                 )
-            encoded = self._embed([record[2] for record in chunk_records])
+            encoded = self._embed(
+                [record[2] for record in chunk_records],
+                usage_scope="index_api",
+            )
             additions = []
             grouped: dict[str, list[np.ndarray]] = {}
             for (file_id, chunk_index, _), vector in zip(chunk_records, encoded):
