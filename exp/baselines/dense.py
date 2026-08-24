@@ -15,6 +15,7 @@ from src.data import RuntimeRepository
 from src.evaluation import apply_budget
 
 from .bm25 import task_query
+from .chunking import TokenChunker
 
 
 class DenseEncoder:
@@ -30,6 +31,7 @@ class DenseEncoder:
         max_retries: int,
         batch_size: int,
         cache_path: Path | str,
+        chunker: TokenChunker,
     ) -> None:
         self.model_name = model_name
         self.clients = [
@@ -42,6 +44,7 @@ class DenseEncoder:
             for api_key in api_keys
         ]
         self.batch_size = batch_size
+        self.chunker = chunker
         self.call_count = 0
         self.pool_lock = Lock()
         self.cache_lock = Lock()
@@ -50,27 +53,31 @@ class DenseEncoder:
         self.cache_path = cache
         self.cache = sqlite3.connect(cache, check_same_thread=False)
         self.cache.execute(
-            "CREATE TABLE IF NOT EXISTS file_embeddings ("
-            "file_version_id TEXT PRIMARY KEY, vector BLOB NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS file_chunk_embeddings ("
+            "file_version_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, "
+            "vector BLOB NOT NULL, PRIMARY KEY(file_version_id, chunk_index))"
         )
 
     def _read_cached_vectors(self, file_ids: Sequence[str]) -> dict[str, np.ndarray]:
-        cached: dict[str, np.ndarray] = {}
+        grouped: dict[str, list[np.ndarray]] = {}
         with self.cache_lock:
             for offset in range(0, len(file_ids), 500):
                 chunk = list(file_ids[offset : offset + 500])
                 placeholders = ",".join("?" for _ in chunk)
                 rows = self.cache.execute(
-                    "SELECT file_version_id, vector FROM file_embeddings "
-                    f"WHERE file_version_id IN ({placeholders})",
+                    "SELECT file_version_id, vector FROM file_chunk_embeddings "
+                    f"WHERE file_version_id IN ({placeholders}) "
+                    "ORDER BY file_version_id, chunk_index",
                     chunk,
                 )
                 for file_version_id, vector in rows:
-                    cached[str(file_version_id)] = np.frombuffer(
-                        vector,
-                        dtype=np.float32,
-                    ).copy()
-        return cached
+                    grouped.setdefault(str(file_version_id), []).append(
+                        np.frombuffer(vector, dtype=np.float32).copy()
+                    )
+        return {
+            file_version_id: np.stack(vectors)
+            for file_version_id, vectors in grouped.items()
+        }
 
     def _embed(self, texts: Sequence[str]) -> np.ndarray:
         vectors = []
@@ -96,33 +103,45 @@ class DenseEncoder:
         self,
         repository: RuntimeRepository,
         files: Sequence[Mapping[str, Any]],
-    ) -> np.ndarray:
+    ) -> list[np.ndarray]:
         file_ids = [str(item["file_version_id"]) for item in files]
         cached = self._read_cached_vectors(file_ids)
         missing_files = [
             item for item in files if str(item["file_version_id"]) not in cached
         ]
         if missing_files:
-            documents = []
+            chunk_records = []
             for item in missing_files:
                 file_record = repository.get_file_version(str(item["file_version_id"]))
-                documents.append(
-                    f"文件路径：{item['path']}\n\n{file_record.get('content') or ''}"
-                )
-            encoded = self._embed(documents)
-            additions = []
-            for item, vector in zip(missing_files, encoded):
                 file_id = str(item["file_version_id"])
-                cached[file_id] = vector
-                additions.append((file_id, vector.tobytes()))
+                chunks = self.chunker.split(
+                    str(file_record.get("content") or ""),
+                    path=str(item["path"]),
+                )
+                chunk_records.extend(
+                    (file_id, chunk_index, text)
+                    for chunk_index, text in enumerate(chunks)
+                )
+            encoded = self._embed([record[2] for record in chunk_records])
+            additions = []
+            grouped: dict[str, list[np.ndarray]] = {}
+            for (file_id, chunk_index, _), vector in zip(chunk_records, encoded):
+                grouped.setdefault(file_id, []).append(vector)
+                additions.append((file_id, chunk_index, vector.tobytes()))
+            cached.update(
+                {
+                    file_id: np.stack(vectors)
+                    for file_id, vectors in grouped.items()
+                }
+            )
             with self.cache_lock:
                 self.cache.executemany(
-                    "INSERT OR REPLACE INTO file_embeddings(file_version_id, vector) "
-                    "VALUES (?, ?)",
+                    "INSERT OR REPLACE INTO file_chunk_embeddings"
+                    "(file_version_id, chunk_index, vector) VALUES (?, ?, ?)",
                     additions,
                 )
                 self.cache.commit()
-        return np.stack([cached[file_id] for file_id in file_ids])
+        return [cached[file_id] for file_id in file_ids]
 
     def rank_files(
         self,
@@ -138,7 +157,9 @@ class DenseEncoder:
 
         query_vector = self._embed([query])[0]
         document_vectors = self._document_vectors(repository, files)
-        scores = document_vectors @ query_vector
+        scores = np.asarray(
+            [float(np.max(vectors @ query_vector)) for vectors in document_vectors]
+        )
 
         ranked_indices = sorted(
             range(len(files)),

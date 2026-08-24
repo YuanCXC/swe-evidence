@@ -35,6 +35,11 @@ from exp.baselines import (  # noqa: E402
     RerankBaseline,
     RerankCaller,
 )
+from exp.baselines.chunking import (  # noqa: E402
+    BGE_TOKENIZER_NAME,
+    BGE_TOKENIZER_REVISION,
+    TokenChunker,
+)
 from exp.baselines.external import (  # noqa: E402
     AgentlessBaseline,
     AgentlessOutputStore,
@@ -260,15 +265,32 @@ def file_label(value: str) -> str:
 
 
 def dense_cache_path(args: argparse.Namespace) -> Path:
-    """生成与 API Profile 和 Dense 模型绑定的文件向量缓存路径。"""
+    """生成与 Dense 模型及文件分块协议绑定的向量缓存路径。"""
 
     model = str(args.active_dense_model)
+    chunk_label = (
+        f"c{args.retrieval_chunk_tokens}"
+        f"-o{args.retrieval_chunk_overlap_tokens}"
+        f"-m{args.retrieval_max_chunks_per_file}"
+    )
     return Path(
         args.dense_cache
         or PROJECT_ROOT
         / "exp/cache/dense"
-        / f"{args.api_profile}-{file_label(model)}.sqlite3"
+        / f"{args.api_profile}-{file_label(model)}-{chunk_label}.sqlite3"
     ).resolve()
+
+
+def build_retrieval_chunker(args: argparse.Namespace) -> TokenChunker:
+    """构造 Dense 与 Rerank 共用的冻结文件分块器。"""
+
+    return TokenChunker(
+        tokenizer_name=args.retrieval_tokenizer,
+        tokenizer_revision=args.retrieval_tokenizer_revision,
+        chunk_tokens=args.retrieval_chunk_tokens,
+        overlap_tokens=args.retrieval_chunk_overlap_tokens,
+        max_chunks_per_file=args.retrieval_max_chunks_per_file,
+    )
 
 
 def default_run_output(args: argparse.Namespace) -> Path:
@@ -562,6 +584,7 @@ def build_shared_resources(
                 max_retries=args.api_max_retries,
                 batch_size=args.dense_batch_size,
                 cache_path=dense_cache_path(args),
+                chunker=build_retrieval_chunker(args),
             ),
             None,
             None,
@@ -585,8 +608,7 @@ def build_shared_resources(
                 api_keys=api_keys,
                 timeout=args.api_timeout,
                 max_retries=args.api_max_retries,
-                max_chunks_per_doc=args.rerank_max_chunks_per_doc,
-                overlap_tokens=args.rerank_overlap_tokens,
+                chunker=build_retrieval_chunker(args),
             ),
             None,
         )
@@ -680,8 +702,15 @@ def build_run_config(
             "hybrid_candidate_file_limit": args.hybrid_candidate_file_limit,
             "rrf_rank_constant": args.rrf_rank_constant,
             "rerank_candidate_file_limit": args.rerank_candidate_file_limit,
-            "rerank_max_chunks_per_doc": args.rerank_max_chunks_per_doc,
-            "rerank_overlap_tokens": args.rerank_overlap_tokens,
+            "retrieval_tokenizer": args.retrieval_tokenizer,
+            "retrieval_tokenizer_revision": args.retrieval_tokenizer_revision,
+            "retrieval_chunk_tokens": args.retrieval_chunk_tokens,
+            "retrieval_chunk_overlap_tokens": (
+                args.retrieval_chunk_overlap_tokens
+            ),
+            "retrieval_max_chunks_per_file": (
+                args.retrieval_max_chunks_per_file
+            ),
             "swerank_top_k": args.swerank_top_k,
             "agentless_stage": args.agentless_stage,
             "locagent_level": args.locagent_level,
@@ -1448,8 +1477,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--hybrid-candidate-file-limit", type=int, default=128)
     run.add_argument("--rrf-rank-constant", type=int, default=60)
     run.add_argument("--rerank-candidate-file-limit", type=int, default=64)
-    run.add_argument("--rerank-max-chunks-per-doc", type=int, default=8)
-    run.add_argument("--rerank-overlap-tokens", type=int, default=64)
+    run.add_argument("--retrieval-tokenizer", default=BGE_TOKENIZER_NAME)
+    run.add_argument(
+        "--retrieval-tokenizer-revision",
+        default=BGE_TOKENIZER_REVISION,
+    )
+    run.add_argument("--retrieval-chunk-tokens", type=int, default=1024)
+    run.add_argument("--retrieval-chunk-overlap-tokens", type=int, default=80)
+    run.add_argument("--retrieval-max-chunks-per-file", type=int, default=8)
     run.add_argument("--swerank-output", type=Path)
     run.add_argument(
         "--swerank-top-k",
@@ -1555,6 +1590,15 @@ def main() -> int:
         and args.expected_task_count <= 0
     ):
         raise ValueError("--expected-task-count 必须大于 0")
+    if hasattr(args, "retrieval_chunk_tokens") and (
+        args.retrieval_chunk_tokens <= args.retrieval_chunk_overlap_tokens
+    ):
+        raise ValueError("--retrieval-chunk-tokens 必须大于分块重叠 Token 数")
+    if (
+        hasattr(args, "retrieval_max_chunks_per_file")
+        and args.retrieval_max_chunks_per_file <= 0
+    ):
+        raise ValueError("--retrieval-max-chunks-per-file 必须大于 0")
     args.handler(args)
     return 0
 
