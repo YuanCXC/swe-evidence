@@ -205,7 +205,8 @@ policy / cost
 - SweRank 等只输出排名的方法使用论文报告的标准 `k` 截断点，分别统计效果、Evidence Token 和效果—成本曲线。
 - 冻结外部结果没有 usage 或轨迹时，对应 API 成本、Agent 轮数和 Tool Call 记为缺失，不能记为 0；Evidence Unit 数与 Evidence Token 始终由映射后的证据包统一计算。
 - 跨方法汇总只使用各运行均成功覆盖的共同任务交集，同时保留每个运行的原始任务数量。
-- 每次 `run` 和 `judge` 都生成同名 `.manifest.json`，冻结代码、数据、checkpoint、模型、提示版本与实验参数；配置不一致时禁止续写已有 JSONL。
+- 实验结果按 `exp/results/{split}/{method}/` 存放，固定使用 `results.jsonl` 和 `manifest.json`；只有 SweRank 的 `k` 或显式 `--run-variant` 才增加变体目录。
+- 离线 Judge 默认写入对应方法目录的 `judgments.jsonl` 和 `judgments.manifest.json`。manifest 冻结代码、数据、checkpoint、模型、提示版本与实验参数；配置不一致时禁止续写已有 JSONL。
 - 论文正式汇总使用 `aggregate --inputs ... --expected-task-count N` 显式选择运行，避免调试 JSONL 意外缩小共同任务交集。
 - 外部方法进入主表时可同时启用 `--require-external-snapshot-verified` 与 `--min-external-mapping-rate`。
 - 机器读取的指标字段使用稳定英文名称；README、注释和大模型可读提示使用中文。

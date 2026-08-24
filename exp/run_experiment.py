@@ -272,86 +272,30 @@ def dense_cache_path(args: argparse.Namespace) -> Path:
 
 
 def default_run_output(args: argparse.Namespace) -> Path:
-    """根据方法、模型和预算生成不会混淆配置的默认结果路径。"""
+    """按 split、方法和必要变体生成固定结果路径。"""
 
-    parts = [args.method]
-    if args.method in CHAT_API_METHODS:
-        model, _, api_keys = resolve_api_config(
-            args,
-            model_argument="planner_model",
-        )
-        args.active_model = model
-        args.active_api_pool_size = len(api_keys)
-        parts.extend((args.api_profile, file_label(model)))
-    if args.method in DENSE_METHODS:
-        model, _, api_keys = resolve_api_config(
-            args,
-            model_argument="dense_model",
-            default_model_env="EMBEDDING_MODEL",
-        )
-        args.active_dense_model = model
-        args.active_api_pool_size = len(api_keys)
-        parts.extend((args.api_profile, file_label(model)))
-    if args.method in RERANK_METHODS:
-        model, _, api_keys = resolve_api_config(
-            args,
-            model_argument="rerank_model",
-            default_model_env="RERANK_MODEL",
-        )
-        args.active_rerank_model = model
-        args.active_api_pool_size = len(api_keys)
-        parts.extend((args.api_profile, file_label(model)))
+    output_dir = DEFAULT_RESULTS / args.split / args.method
+    variant = run_variant(args)
+    if variant:
+        output_dir /= variant
+    return output_dir / "results.jsonl"
+
+
+def run_variant(args: argparse.Namespace) -> str | None:
+    """仅为确实需要并存的实验配置生成目录名。"""
+
+    if args.run_variant:
+        return file_label(args.run_variant)
     if args.method == "swerank":
-        parts.extend(
-            (
-                file_label(Path(args.swerank_output).stem),
-                f"k{args.swerank_top_k}",
-            )
-        )
-    if args.method == "agentless":
-        parts.extend(
-            (
-                file_label(Path(args.agentless_output).stem),
-                args.agentless_stage,
-            )
-        )
-    if args.method == "locagent":
-        parts.extend(
-            (
-                file_label(Path(args.locagent_output).stem),
-                args.locagent_level,
-            )
-        )
-    if args.checkpoint:
-        parts.append(file_label(args.checkpoint.name))
-    if args.method not in EXTERNAL_METHODS:
-        parts.extend(
-            (
-                f"u{args.evidence_unit_budget}",
-                f"t{args.evidence_token_budget}",
-                f"r{args.retrieval_limit}",
-            )
-        )
-    if args.method in ("bm25", *DENSE_METHODS, *RERANK_METHODS):
-        parts.append(f"f{args.file_limit}")
-    if args.method == "hybrid":
-        parts.extend(
-            (
-                f"cf{args.hybrid_candidate_file_limit}",
-                f"k{args.rrf_rank_constant}",
-            )
-        )
-    if args.method == "rerank":
-        parts.extend(
-            (
-                f"cf{args.rerank_candidate_file_limit}",
-                f"mc{args.rerank_max_chunks_per_doc}",
-                f"o{args.rerank_overlap_tokens}",
-            )
-        )
-    if args.method == "fixed_iterative":
-        parts.append(f"s{args.fixed_steps}")
-    return DEFAULT_RESULTS / args.split / ("-".join(parts) + ".jsonl")
+        return f"k{args.swerank_top_k}"
+    return None
+
+
+def default_run_name(args: argparse.Namespace) -> str:
+    """生成汇总表中稳定且可读的运行名称。"""
+
+    variant = run_variant(args)
+    return f"{args.method}/{variant}" if variant else args.method
 
 
 def append_jsonl(file: Any, row: Mapping[str, Any]) -> None:
@@ -704,6 +648,7 @@ def build_run_config(
 
     config: dict[str, Any] = {
         "method": args.method,
+        "run_variant": run_variant(args),
         "split": args.split,
         "code": code_identity(PROJECT_ROOT, ("src", "exp")),
         "tasks": artifact_identity(args.tasks),
@@ -767,7 +712,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     output = args.output or default_run_output(args)
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    run_name = output.stem
+    run_name = default_run_name(args)
     reader = TaskReader(args.tasks)
     (
         planner,
@@ -951,9 +896,7 @@ def run_judge(args: argparse.Namespace) -> None:
         args,
         model_argument="judge_model",
     )
-    output = args.output or input_path.with_name(
-        f"{input_path.stem}.{args.api_profile}-{file_label(model)}.judgments.jsonl"
-    )
+    output = args.output or input_path.with_name("judgments.jsonl")
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     args.active_api_base = api_base
@@ -1196,15 +1139,19 @@ def run_aggregate(args: argparse.Namespace) -> None:
 
     if args.inputs:
         raw_paths = [Path(path).resolve() for path in args.inputs]
-        input_dir = raw_paths[0].parent
+        input_dir = Path(
+            os.path.commonpath([str(path.parent) for path in raw_paths])
+        )
         for path in raw_paths:
             validate_result_manifest(path)
     else:
         input_dir = Path(args.input_dir).resolve()
         raw_paths = sorted(
             path
-            for path in input_dir.glob("*.jsonl")
-            if not path.name.endswith(".judgments.jsonl")
+            for path in input_dir.rglob("*.jsonl")
+            if "_failed" not in path.parts
+            and path.name != "judgments.jsonl"
+            and not path.name.endswith(".judgments.jsonl")
         )
     if not raw_paths:
         raise ValueError("没有指定可汇总的实验结果 JSONL")
@@ -1364,7 +1311,15 @@ def run_aggregate(args: argparse.Namespace) -> None:
     judgment_paths = (
         [Path(path).resolve() for path in args.judgments]
         if args.judgments
-        else sorted(input_dir.glob("*.judgments.jsonl"))
+        else sorted(
+            path
+            for path in input_dir.rglob("*.jsonl")
+            if "_failed" not in path.parts
+            and (
+                path.name == "judgments.jsonl"
+                or path.name.endswith(".judgments.jsonl")
+            )
+        )
         if not args.inputs
         else []
     )
@@ -1459,6 +1414,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--tasks", type=Path, default=DEFAULT_TASKS)
     run.add_argument("--runtime", type=Path, default=DEFAULT_RUNTIME)
     run.add_argument("--output", type=Path)
+    run.add_argument(
+        "--run-variant",
+        help="仅在同一方法需要保留多个配置时指定，如 stage1 或 final",
+    )
     run.add_argument("--planner-model", help="覆盖 Profile 对应的 Planner 模型名")
     run.add_argument("--checkpoint", type=Path)
     run.add_argument("--device", default="auto")

@@ -86,6 +86,10 @@ def config_hash(config: Mapping[str, Any]) -> str:
 
 def manifest_path(output: Path | str) -> Path:
     target = Path(output).resolve()
+    if target.name == "results.jsonl":
+        return target.with_name("manifest.json")
+    if target.name == "judgments.jsonl":
+        return target.with_name("judgments.manifest.json")
     return target.with_name(target.name + ".manifest.json")
 
 
