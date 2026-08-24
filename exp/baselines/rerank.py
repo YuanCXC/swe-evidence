@@ -30,6 +30,7 @@ class RerankCaller:
         timeout: float,
         max_retries: int,
         chunker: TokenChunker,
+        query_token_limit: int,
     ) -> None:
         self.model_name = model_name
         self.clients = [
@@ -41,6 +42,7 @@ class RerankCaller:
             for api_key in api_keys
         ]
         self.chunker = chunker
+        self.query_token_limit = query_token_limit
         self.max_retries = max_retries
         self.call_count = 0
         self.pool_lock = Lock()
@@ -124,11 +126,11 @@ class RerankBaseline:
     def run(self, task: Mapping[str, Any]) -> dict[str, Any]:
         """对 BM25 候选文件进行 Issue–文件相关性重排序。"""
 
-        query = task_query(task["input"])
+        full_query = task_query(task["input"])
         candidates = self.repository.search_files(
             snapshot_id=str(task["snapshot_id"]),
             repo=str(task["input"]["repo"]),
-            terms=retrieval_terms(query)[:64],
+            terms=retrieval_terms(full_query)[:64],
             limit=self.candidate_file_limit,
         )
         if not candidates:
@@ -152,6 +154,10 @@ class RerankBaseline:
             )
             documents.extend(chunks)
             chunk_file_indices.extend([file_index] * len(chunks))
+        query = self.caller.chunker.truncate(
+            full_query,
+            max_tokens=self.caller.query_token_limit,
+        )
         reranked = self.caller.rank(
             query=query,
             documents=documents,

@@ -38,22 +38,24 @@ class TokenChunker:
             verbose=False,
         )
 
-    def _fit_chunk(self, text: str) -> str:
+    def truncate(self, text: str, *, max_tokens: int) -> str:
+        """按 BGE tokenizer 将文本精确限制在指定 Token 数内。"""
+
         special_tokens = self.tokenizer.num_special_tokens_to_add(pair=False)
-        token_ids = self._encode(text)[: self.chunk_tokens - special_tokens]
-        chunk = self.tokenizer.decode(
+        token_ids = self._encode(text)[: max_tokens - special_tokens]
+        truncated = self.tokenizer.decode(
             token_ids,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        while len(self._encode(chunk)) + special_tokens > self.chunk_tokens:
+        while len(self._encode(truncated)) + special_tokens > max_tokens:
             token_ids.pop()
-            chunk = self.tokenizer.decode(
+            truncated = self.tokenizer.decode(
                 token_ids,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
-        return chunk
+        return truncated
 
     def split(self, content: str, *, path: str) -> list[str]:
         """为每个块保留文件路径，并按文件顺序截取前若干块。"""
@@ -78,7 +80,7 @@ class TokenChunker:
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
-            chunks.append(self._fit_chunk(prefix + body))
+            chunks.append(self.truncate(prefix + body, max_tokens=self.chunk_tokens))
             if len(chunks) >= self.max_chunks_per_file:
                 break
         return chunks

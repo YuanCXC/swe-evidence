@@ -200,7 +200,7 @@ policy / cost
 - 实验入口脚本放在 `exp/`，由入口脚本组织数据读取、方法运行和结果写出。
 - 所有 Baseline 必须先通过 `output_adapter.py` 映射为统一 Evidence Package。
 - Ours 及其消融使用相同的安全上限，但由 Policy 自主 STOP，不要求选满预算。
-- Dense 与 Rerank 使用冻结的 `BAAI/bge-m3` tokenizer 对文件正文分块：每块最多 1024 Token、相邻块重叠 80 Token、每个文件最多保留前 8 块，并以最高块得分作为文件得分。分词器仅用于本地切分，Embedding 与 Rerank 推理仍通过 API 执行。
+- Dense 与 Rerank 使用冻结的 `BAAI/bge-m3` tokenizer 对文件正文分块：每块最多 1024 Token、相邻块重叠 80 Token、每个文件最多保留前 8 块，并以最高块得分作为文件得分。Rerank 模型输入的 query 最多保留 4096 Token，但 BM25 候选召回仍使用完整在线问题。分词器仅用于本地切分，Embedding 与 Rerank 推理仍通过 API 执行。
 - Agentless、LocAgent 等具有原生终止行为的方法保留其最终输出，不强制对齐证据数量。
 - Agentless 必须显式区分 `file`、`related`、`edit` 阶段；LocAgent 必须显式区分 `file`、`module`、`function` 层级，不跨阶段或层级拼接结果。
 - SweRank 等只输出排名的方法使用论文报告的标准 `k` 截断点，分别统计效果、Evidence Token 和效果—成本曲线。

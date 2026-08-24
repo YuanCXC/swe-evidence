@@ -609,6 +609,7 @@ def build_shared_resources(
                 timeout=args.api_timeout,
                 max_retries=args.api_max_retries,
                 chunker=build_retrieval_chunker(args),
+                query_token_limit=args.rerank_query_token_limit,
             ),
             None,
         )
@@ -702,6 +703,7 @@ def build_run_config(
             "hybrid_candidate_file_limit": args.hybrid_candidate_file_limit,
             "rrf_rank_constant": args.rrf_rank_constant,
             "rerank_candidate_file_limit": args.rerank_candidate_file_limit,
+            "rerank_query_token_limit": args.rerank_query_token_limit,
             "retrieval_tokenizer": args.retrieval_tokenizer,
             "retrieval_tokenizer_revision": args.retrieval_tokenizer_revision,
             "retrieval_chunk_tokens": args.retrieval_chunk_tokens,
@@ -1477,6 +1479,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--hybrid-candidate-file-limit", type=int, default=128)
     run.add_argument("--rrf-rank-constant", type=int, default=60)
     run.add_argument("--rerank-candidate-file-limit", type=int, default=64)
+    run.add_argument("--rerank-query-token-limit", type=int, default=4096)
     run.add_argument("--retrieval-tokenizer", default=BGE_TOKENIZER_NAME)
     run.add_argument(
         "--retrieval-tokenizer-revision",
@@ -1599,6 +1602,10 @@ def main() -> int:
         and args.retrieval_max_chunks_per_file <= 0
     ):
         raise ValueError("--retrieval-max-chunks-per-file 必须大于 0")
+    if hasattr(args, "rerank_query_token_limit") and (
+        args.rerank_query_token_limit <= 0
+    ):
+        raise ValueError("--rerank-query-token-limit 必须大于 0")
     args.handler(args)
     return 0
 
