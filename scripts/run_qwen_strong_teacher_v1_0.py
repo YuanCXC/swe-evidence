@@ -9,7 +9,7 @@ Qwen Offline Strong-Teacher Runner
 1. 1 个 Markdown TASK = 1 次 API 请求。
 2. 输入来自 frozen Strong-Teacher MD；不修改输入文件。
 3. 输出写入:
-       data/.external_supervision/result/{train,validation,benchmark}/<same_filename>.md
+       data/upstream/external_supervision/result/{train,validation,benchmark}/<same_filename>.md
 4. 已存在且 size > 0 的结果文件：绝不覆盖，直接 skip。
 5. 已存在且 size == 0 的结果文件：允许重新生成；只有 API + 校验全部成功后才原子覆盖。
 6. 最终结果必须是纯 JSON array，且只包含当前 task_id 的一个 object。
@@ -79,10 +79,10 @@ except ImportError as exc:
 
 SCRIPT_VERSION = "1.0.0"
 CACHE_MARKER = "[CACHEABLE FIXED PREFIX END]"
-DEFAULT_INPUT_ROOT = Path("data/.external_supervision/strong_teacher_v1_3_all")
-DEFAULT_RESULT_ROOT = Path("data/.external_supervision/result")
+DEFAULT_INPUT_ROOT = Path("data/upstream/external_supervision/strong_teacher_v1_3_all")
+DEFAULT_RESULT_ROOT = Path("data/upstream/external_supervision/result")
 DEFAULT_USAGE_LOG = Path(
-    "data/.external_supervision/.run_logs/qwen_strong_teacher_usage.jsonl"
+    "data/upstream/external_supervision/.run_logs/qwen_strong_teacher_usage.jsonl"
 )
 SPLITS = ("train", "validation", "benchmark")
 

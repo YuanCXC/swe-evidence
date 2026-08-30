@@ -19,9 +19,9 @@ Design goals
 Typical use
 -----------
 python scripts/repair_strong_teacher_invalid_json_v1_0.py ^
-  --input-root data/.external_supervision/strong_teacher_v1_3_all ^
-  --result-root data/.external_supervision/result ^
-  --issues-csv data/.external_supervision/.audit/strong_teacher_audit/audit_issues.csv
+  --input-root data/upstream/external_supervision/strong_teacher_v1_3_all ^
+  --result-root data/upstream/external_supervision/result ^
+  --issues-csv data/upstream/external_supervision/.audit/strong_teacher_audit/audit_issues.csv
 
 Then inspect the report and apply:
 python scripts/repair_strong_teacher_invalid_json_v1_0.py ... --apply
@@ -91,32 +91,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--input-root",
         type=Path,
-        default=Path("data/.external_supervision/strong_teacher_v1_3_all"),
+        default=Path("data/upstream/external_supervision/strong_teacher_v1_3_all"),
     )
     p.add_argument(
         "--result-root",
         type=Path,
-        default=Path("data/.external_supervision/result"),
+        default=Path("data/upstream/external_supervision/result"),
     )
     p.add_argument(
         "--issues-csv",
         type=Path,
         default=Path(
-            "data/.external_supervision/.audit/strong_teacher_audit/audit_issues.csv"
+            "data/upstream/external_supervision/.audit/strong_teacher_audit/audit_issues.csv"
         ),
     )
     p.add_argument(
         "--report-root",
         type=Path,
         default=Path(
-            "data/.external_supervision/.repair/strong_teacher_invalid_json_v1_0"
+            "data/upstream/external_supervision/.repair/strong_teacher_invalid_json_v1_0"
         ),
     )
     p.add_argument(
         "--backup-root",
         type=Path,
         default=Path(
-            "data/.external_supervision/.repair_backups/strong_teacher_invalid_json_v1_0"
+            "data/upstream/external_supervision/.repair_backups/strong_teacher_invalid_json_v1_0"
         ),
     )
     p.add_argument(

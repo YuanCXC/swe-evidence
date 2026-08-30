@@ -1,27 +1,13 @@
 # 敏感信息
 .env
 
-# 外部仓库 bare clone 缓存（5GB+，非项目源码）
-data/cache/
-
-# 超过 GitHub 100MB 单文件上限的大文件（后续单独处理）
-data/processed/normalized_instances.jsonl
-data/registry/master_instances.jsonl
-data/splits/train.jsonl
-data/raw/swebench/train-00000-of-00001.parquet
-
-# 构建中间状态（含大型 SQLite 状态库、日志、审计产物）
-data/.build/
-data/.external_supervision/
-
-# 数据集二进制与运行时数据库不进入 Git；README、manifest 和审计摘要仍可提交
-data/**/*.parquet
-data/**/*.sqlite3
-data/**/*.sqlite3-*
+# 数据目录整体不进入 Git（原始数据、数据集、运行时库与审计产物均在本地维护）
+data/
 
 # 模型、第三方模型缓存和本地智能体记忆
 models/
 .mnemon/
+.mimosa/
 
 # 实验运行产物与向量缓存
 exp/results/

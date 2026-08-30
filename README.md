@@ -325,7 +325,7 @@ STOP   =    42,284
 当前机械冻结 Teacher：
 
 ```text
-data/strong_teacher_mechanical_v1_0.parquet
+data/upstream/strong_teacher_mechanical_v1_0.parquet
 ```
 
 统计：
@@ -380,8 +380,10 @@ Excluded         =      5
 
 最终面向训练与 rollout 的自包含数据包为：
 
+完整的数据目录分层与验证入口见 [`data/README.md`](data/README.md)。
+
 ```text
-data/evidence_agent_dataset_v1/
+data/evidence_agent_final_v1/
 ├── tasks.parquet
 ├── policy_evidence.parquet
 ├── repository_runtime.sqlite3

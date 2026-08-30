@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
-DEFAULT_DATASET_DIR = Path("data/unified_swe_dataset_v2_10")
+DEFAULT_DATASET_DIR = Path("data/upstream/unified_swe_dataset_v2_10")
 DEFAULT_OUTPUT = Path("data/.train_cache/policy_evidence_v2_10.sqlite3")
 DEFAULT_SPLITS = ("train", "validation", "benchmark")
 

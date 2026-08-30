@@ -7,8 +7,8 @@ audit_integrated_training_dataset_v1_1.py
 所有下游 Policy 依赖都已经重新生成，而不是继续沿用旧 trajectory/policy labels。
 
 默认：
-  base:    data/unified_swe_dataset_v2_10/
-  derived: data/unified_swe_dataset_v2_10_teacher_v1/
+  base:    data/upstream/unified_swe_dataset_v2_10/
+  derived: data/upstream/unified_swe_dataset_v2_10_teacher_v1/
   db:      data/.build/unified_swe_v1.sqlite3
 
 检查：
@@ -240,8 +240,8 @@ def validate_snapshot_pairs(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--base-dir", type=Path, default=Path("data/unified_swe_dataset_v2_10"))
-    p.add_argument("--derived-dir", type=Path, default=Path("data/unified_swe_dataset_v2_10_teacher_v1"))
+    p.add_argument("--base-dir", type=Path, default=Path("data/upstream/unified_swe_dataset_v2_10"))
+    p.add_argument("--derived-dir", type=Path, default=Path("data/upstream/unified_swe_dataset_v2_10_teacher_v1"))
     p.add_argument("--build-db", type=Path, default=Path("data/.build/unified_swe_v1.sqlite3"))
     p.add_argument("--report", type=Path, default=None)
     p.add_argument("--batch-size", type=int, default=32)

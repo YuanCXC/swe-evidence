@@ -7,8 +7,8 @@ mark_integrated_experiment_exclusions_v1_0_1.py
 标记为 experiment_eligible=false，而不是回退到旧 V2.10 supervision，也不是物理删行。
 
 默认输入：
-  data/unified_swe_dataset_v2_10_teacher_v1/
-  data/unified_swe_dataset_v2_10_teacher_v1/integrity_audit.json
+  data/upstream/unified_swe_dataset_v2_10_teacher_v1/
+  data/upstream/unified_swe_dataset_v2_10_teacher_v1/integrity_audit.json
 
 默认只从审计错误中提取：
   POSITIVE_UNSCOREABLE
@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--derived-dir",
         type=Path,
-        default=Path("data/unified_swe_dataset_v2_10_teacher_v1"),
+        default=Path("data/upstream/unified_swe_dataset_v2_10_teacher_v1"),
     )
     p.add_argument("--audit-json", type=Path, default=None)
     p.add_argument("--batch-size", type=int, default=256)

@@ -1142,7 +1142,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--dataset-dir",
         type=Path,
-        default=Path("data/unified_swe_dataset_v2_10"),
+        default=Path("data/upstream/unified_swe_dataset_v2_10"),
     )
     prepare.add_argument(
         "--evidence-cache",
@@ -1164,7 +1164,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--output",
         type=Path,
-        default=Path("data/.external_supervision/merge_context.jsonl"),
+        default=Path("data/upstream/external_supervision/merge_context.jsonl"),
     )
     add_candidate_override_args(prepare)
     prepare.set_defaults(func=prepare_context)
@@ -1184,7 +1184,7 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/.external_supervision/refinement"),
+        default=Path("data/upstream/external_supervision/refinement"),
     )
     build.set_defaults(func=build_refinement)
 

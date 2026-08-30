@@ -7,7 +7,7 @@ integrate_strong_teacher_supervision_v1_0.py
 Supervision Overlay Dataset（监督侧车数据集）。
 
 设计边界：
-1. 绝不修改 data/unified_swe_dataset_v2_10/。
+1. 绝不修改 data/upstream/unified_swe_dataset_v2_10/。
 2. Candidate Number 只作为 Teacher 接口；最终 Witness 一律解析为稳定 evidence_id。
 3. OR-of-AND 原样保持：组内 AND、组间 OR，不拍平、不猜测语义。
 4. supporting_candidates 只做 supporting_evidence_ids 记录，绝不自动提升为 sufficient witness。
@@ -26,14 +26,14 @@ Supervision Overlay Dataset（监督侧车数据集）。
     scripts/integrate_strong_teacher_supervision_v1_0.py
 
 默认输入：
-    data/unified_swe_dataset_v2_10/
-    data/.external_supervision/strong_teacher_v1_3_all/
-    data/.external_supervision/result/
-    data/.external_supervision/.audit/strong_teacher_audit/audit_summary.json
-    data/.external_supervision/.audit/strong_teacher_audit/per_answer_status.csv
+    data/upstream/unified_swe_dataset_v2_10/
+    data/upstream/external_supervision/strong_teacher_v1_3_all/
+    data/upstream/external_supervision/result/
+    data/upstream/external_supervision/.audit/strong_teacher_audit/audit_summary.json
+    data/upstream/external_supervision/.audit/strong_teacher_audit/per_answer_status.csv
 
 默认输出：
-    data/.external_supervision/integrated_strong_teacher_v1_0/
+    data/upstream/external_supervision/integrated_strong_teacher_v1_0/
       train_strong_teacher_overlay.parquet
       validation_strong_teacher_overlay.parquet
       benchmark_strong_teacher_overlay.parquet
@@ -1312,17 +1312,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--dataset-dir",
         type=Path,
-        default=Path("data/unified_swe_dataset_v2_10"),
+        default=Path("data/upstream/unified_swe_dataset_v2_10"),
     )
     p.add_argument(
         "--input-root",
         type=Path,
-        default=Path("data/.external_supervision/strong_teacher_v1_3_all"),
+        default=Path("data/upstream/external_supervision/strong_teacher_v1_3_all"),
     )
     p.add_argument(
         "--result-root",
         type=Path,
-        default=Path("data/.external_supervision/result"),
+        default=Path("data/upstream/external_supervision/result"),
     )
     p.add_argument(
         "--build-db",
@@ -1333,14 +1333,14 @@ def parse_args() -> argparse.Namespace:
         "--audit-summary",
         type=Path,
         default=Path(
-            "data/.external_supervision/.audit/strong_teacher_audit/audit_summary.json"
+            "data/upstream/external_supervision/.audit/strong_teacher_audit/audit_summary.json"
         ),
     )
     p.add_argument(
         "--per-answer-status",
         type=Path,
         default=Path(
-            "data/.external_supervision/.audit/strong_teacher_audit/per_answer_status.csv"
+            "data/upstream/external_supervision/.audit/strong_teacher_audit/per_answer_status.csv"
         ),
     )
     p.add_argument(
@@ -1353,7 +1353,7 @@ def parse_args() -> argparse.Namespace:
         "--output-root",
         type=Path,
         default=Path(
-            "data/.external_supervision/integrated_strong_teacher_v1_0"
+            "data/upstream/external_supervision/integrated_strong_teacher_v1_0"
         ),
     )
     p.add_argument(

@@ -14,12 +14,12 @@ Strong-Teacher 结果离线审计器。
 
 默认目录契约：
   input:
-    data/.external_supervision/strong_teacher_v1_3_all/{split}/md/*.md
+    data/upstream/external_supervision/strong_teacher_v1_3_all/{split}/md/*.md
   result:
-    data/.external_supervision/result/{split}/*.md
+    data/upstream/external_supervision/result/{split}/*.md
 
 报告默认写入：
-  data/.external_supervision/.audit/strong_teacher_audit/
+  data/upstream/external_supervision/.audit/strong_teacher_audit/
 
 重要边界：
 - HARD_ERROR 只用于可以机械证明的异常。
@@ -113,17 +113,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--input-root",
         type=Path,
-        default=Path("data/.external_supervision/strong_teacher_v1_3_all"),
+        default=Path("data/upstream/external_supervision/strong_teacher_v1_3_all"),
     )
     p.add_argument(
         "--result-root",
         type=Path,
-        default=Path("data/.external_supervision/result"),
+        default=Path("data/upstream/external_supervision/result"),
     )
     p.add_argument(
         "--report-root",
         type=Path,
-        default=Path("data/.external_supervision/.audit/strong_teacher_audit"),
+        default=Path("data/upstream/external_supervision/.audit/strong_teacher_audit"),
     )
     p.add_argument(
         "--splits",

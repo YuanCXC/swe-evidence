@@ -7,23 +7,23 @@ build_integrated_training_dataset_v1_3.py
 新的派生数据集，最终输出放在普通 data/ 目录下，而不是 .external_supervision 下。
 
 默认输入：
-    data/unified_swe_dataset_v2_10/
+    data/upstream/unified_swe_dataset_v2_10/
 
 Strong-Teacher freeze 自动按下列顺序寻找：
     1) --teacher-parquet 显式指定
-    2) data/strong_teacher_mechanical_v1_0.parquet
-    3) data/.external_supervision/frozen/strong_teacher_mechanical_v1_0/
+    2) data/upstream/strong_teacher_mechanical_v1_0.parquet
+    3) data/upstream/external_supervision/frozen/strong_teacher_mechanical_v1_0/
        strong_teacher_mechanical_v1_0.parquet
 
 默认输出：
-    data/unified_swe_dataset_v2_10_teacher_v1/
+    data/upstream/unified_swe_dataset_v2_10_teacher_v1/
       train.parquet
       validation.parquet
       benchmark.parquet
       manifest.json
 
 核心设计：
-1. 永不修改 data/unified_swe_dataset_v2_10/。
+1. 永不修改 data/upstream/unified_swe_dataset_v2_10/。
 2. 保留全部 20,864 个 V2.10 task；没有 Teacher 的 task 保留原 supervision。
 3. Strong-Teacher Candidate Number 只作为接口；最终 Witness 绑定稳定 evidence_id。
 4. OR-of-AND 保持：组内 AND、组间 OR，不拍平。
@@ -1276,13 +1276,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--dataset-dir",
         type=Path,
-        default=Path("data/unified_swe_dataset_v2_10"),
+        default=Path("data/upstream/unified_swe_dataset_v2_10"),
     )
     p.add_argument(
         "--teacher-parquet",
         type=Path,
         default=None,
-        help="默认自动查找 data/strong_teacher_mechanical_v1_0.parquet 或 hidden freeze。",
+        help="默认自动查找 data/upstream/strong_teacher_mechanical_v1_0.parquet 或 hidden freeze。",
     )
     p.add_argument(
         "--teacher-manifest",
@@ -1319,7 +1319,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/unified_swe_dataset_v2_10_teacher_v1"),
+        default=Path("data/upstream/unified_swe_dataset_v2_10_teacher_v1"),
     )
     p.add_argument("--teacher-confidence", type=float, default=0.0, help="Mechanical Teacher 尚未语义验证；默认不伪造语义 confidence。仅作为 obligation/witness metadata。")
     p.add_argument("--batch-size", type=int, default=16)

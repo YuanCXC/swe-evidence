@@ -3,7 +3,7 @@
 """Train the Evidence Policy Cross-Encoder from the final four-file bundle.
 
 Normal data dependency (and only data dependency):
-    data/evidence_agent_dataset_v1/
+    data/evidence_agent_final_v1/
       - tasks.parquet
       - policy_evidence.parquet
       - manifest.json
@@ -52,7 +52,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 
 SCRIPT_VERSION = "1.5.0"
-DEFAULT_BUNDLE_DIR = Path("data/evidence_agent_dataset_v1")
+DEFAULT_BUNDLE_DIR = Path("data/evidence_agent_final_v1")
 DEFAULT_OUTPUT_DIR = Path("models/evidence_policy_v1_0")
 DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_MODEL_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
@@ -1770,7 +1770,7 @@ def self_test() -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Train Evidence Policy only from data/evidence_agent_dataset_v1."
+        description="Train Evidence Policy only from data/evidence_agent_final_v1."
     )
     p.add_argument("--bundle-dir", type=Path, default=DEFAULT_BUNDLE_DIR)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)

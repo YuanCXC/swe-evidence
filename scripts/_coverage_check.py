@@ -7,7 +7,7 @@ result/<split>/*.md，判断哪些源文件已有合法 JSON array 结果。
 """
 import os, json, sys
 
-ROOT = "E:/Code_Personal/Subject/evidence-agent/data/.external_supervision"
+ROOT = "E:/Code_Personal/Subject/evidence-agent/data/upstream/external_supervision"
 SRC_BASE = os.path.join(ROOT, "strong_teacher_v1_3_all")
 OUT_BASE = os.path.join(ROOT, "result")
 

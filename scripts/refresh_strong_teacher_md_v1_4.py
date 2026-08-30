@@ -18,7 +18,7 @@ Strong-Teacher Markdown Prompt Refresher v1.4
     - 不修改 Candidate Pool / Issue / Gold Hints / task_id / 文件名。
 
 默认输入目录：
-    data/.external_supervision/strong_teacher_v1_3_all/
+    data/upstream/external_supervision/strong_teacher_v1_3_all/
 
 目录结构：
     train/md/*.md
@@ -36,12 +36,12 @@ Strong-Teacher Markdown Prompt Refresher v1.4
 用法（PowerShell）：
 
     python scripts/refresh_strong_teacher_md_v1_4.py `
-      --root data/.external_supervision/strong_teacher_v1_3_all
+      --root data/upstream/external_supervision/strong_teacher_v1_3_all
 
 先检查不写盘：
 
     python scripts/refresh_strong_teacher_md_v1_4.py `
-      --root data/.external_supervision/strong_teacher_v1_3_all `
+      --root data/upstream/external_supervision/strong_teacher_v1_3_all `
       --dry-run
 """
 
@@ -62,7 +62,7 @@ except ImportError as exc:
 SCRIPT_VERSION = "1.4.0"
 PROMPT_CONTRACT_VERSION = "minimal-sufficient-witness-v1.4"
 
-DEFAULT_ROOT = Path("data/.external_supervision/strong_teacher_v1_3_all")
+DEFAULT_ROOT = Path("data/upstream/external_supervision/strong_teacher_v1_3_all")
 DEFAULT_SPLITS = ("train", "validation", "benchmark")
 
 
@@ -438,7 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ROOT,
         help=(
             "Strong-Teacher 全量导出根目录。默认："
-            "data/.external_supervision/strong_teacher_v1_3_all"
+            "data/upstream/external_supervision/strong_teacher_v1_3_all"
         ),
     )
     parser.add_argument(

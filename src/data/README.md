@@ -33,7 +33,7 @@
 数据层面向以下冻结 bundle：
 
 ```text
-data/evidence_agent_dataset_v1/
+data/evidence_agent_final_v1/
 ├── tasks.parquet
 ├── policy_evidence.parquet
 ├── repository_runtime.sqlite3
@@ -117,7 +117,7 @@ Runtime 中约有 2,549.6 万个 Evidence Units。文件级 FTS5 索引用于候
 ```python
 from src.data import TaskReader
 
-reader = TaskReader("data/evidence_agent_dataset_v1/tasks.parquet")
+reader = TaskReader("data/evidence_agent_final_v1/tasks.parquet")
 task = reader.get_task("task_0004c3905bec5145332e53ba")
 print(task["input"]["problem_statement"])
 ```
@@ -128,7 +128,7 @@ print(task["input"]["problem_statement"])
 from src.data import RuntimeRepository
 
 with RuntimeRepository(
-    "data/evidence_agent_dataset_v1/repository_runtime.sqlite3"
+    "data/evidence_agent_final_v1/repository_runtime.sqlite3"
 ) as repository:
     files = repository.search_files(
         snapshot_id=task["snapshot_id"],
@@ -143,7 +143,7 @@ with RuntimeRepository(
 ```python
 from src.data.supervision_reader import SupervisionReader
 
-reader = SupervisionReader("data/evidence_agent_dataset_v1/tasks.parquet")
+reader = SupervisionReader("data/evidence_agent_final_v1/tasks.parquet")
 references = reader.get_references("task_0004c3905bec5145332e53ba")
 ```
 

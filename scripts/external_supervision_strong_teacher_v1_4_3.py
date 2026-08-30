@@ -182,37 +182,37 @@ A. 导出一次性 Strong Teacher Markdown：
 
     python scripts/external_supervision_strong_teacher.py export-unified `
       --requests data/.supervision_refinement/.../refinement_requests.jsonl `
-      --output-dir data/.external_supervision/strong_teacher `
+      --output-dir data/upstream/external_supervision/strong_teacher `
       --batch-size 1
 
 B. 网页模型返回 JSON 后做宽松语义 + 严格身份校验：
 
     python scripts/external_supervision_strong_teacher.py validate-unified `
       --requests data/.supervision_refinement/.../refinement_requests.jsonl `
-      --results data/.external_supervision/strong_teacher/results.json `
-      --output data/.external_supervision/strong_teacher/results.normalized.jsonl `
-      --errors data/.external_supervision/strong_teacher/results.errors.jsonl
+      --results data/upstream/external_supervision/strong_teacher/results.json `
+      --output data/upstream/external_supervision/strong_teacher/results.normalized.jsonl `
+      --errors data/upstream/external_supervision/strong_teacher/results.errors.jsonl
 
 C. 先用 external_supervision_merge.py prepare-context 建立机器上下文 / Candidate Identity Lock：
 
     python scripts/external_supervision_merge.py prepare-context `
       --requests data/.supervision_refinement/.../refinement_requests.jsonl `
       --split validation `
-      --output data/.external_supervision/merge_context.jsonl
+      --output data/upstream/external_supervision/merge_context.jsonl
 
 D. 一次性结果接回 v1.9.2.1 + Core v1.7：
 
     python scripts/external_supervision_strong_teacher.py build-refinement `
-      --context data/.external_supervision/merge_context.jsonl `
-      --results data/.external_supervision/strong_teacher/results.normalized.jsonl `
-      --output-dir data/.external_supervision/strong_teacher/refinement
+      --context data/upstream/external_supervision/merge_context.jsonl `
+      --results data/upstream/external_supervision/strong_teacher/results.normalized.jsonl `
+      --output-dir data/upstream/external_supervision/strong_teacher/refinement
 
 E. 从冻结 V2.10 直接导出完整 20,864 个 Strong-Teacher Markdown：
 
     python scripts/external_supervision_strong_teacher.py export-all `
       --runner scripts/refine_supervision_with_llm.py `
-      --dataset-dir data/unified_swe_dataset_v2_10 `
-      --output-dir data/.external_supervision/strong_teacher_v1_3_all `
+      --dataset-dir data/upstream/unified_swe_dataset_v2_10 `
+      --output-dir data/upstream/external_supervision/strong_teacher_v1_3_all `
       --tasks-per-md 1
 """
 
@@ -3008,7 +3008,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/.external_supervision/strong_teacher"),
+        default=Path("data/upstream/external_supervision/strong_teacher"),
     )
     export.add_argument(
         "--batch-size",
@@ -3037,7 +3037,7 @@ def build_parser() -> argparse.ArgumentParser:
     export_all_parser.add_argument(
         "--dataset-dir",
         type=Path,
-        default=Path("data/unified_swe_dataset_v2_10"),
+        default=Path("data/upstream/unified_swe_dataset_v2_10"),
     )
     export_all_parser.add_argument(
         "--evidence-cache",
@@ -3061,7 +3061,7 @@ def build_parser() -> argparse.ArgumentParser:
     export_all_parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/.external_supervision/strong_teacher_v1_3_all"),
+        default=Path("data/upstream/external_supervision/strong_teacher_v1_3_all"),
     )
     export_all_parser.add_argument(
         "--tasks-per-md",
@@ -3110,14 +3110,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         default=Path(
-            "data/.external_supervision/strong_teacher/results.normalized.jsonl"
+            "data/upstream/external_supervision/strong_teacher/results.normalized.jsonl"
         ),
     )
     validate.add_argument(
         "--errors",
         type=Path,
         default=Path(
-            "data/.external_supervision/strong_teacher/results.errors.jsonl"
+            "data/upstream/external_supervision/strong_teacher/results.errors.jsonl"
         ),
     )
     validate.set_defaults(func=validate_unified)
@@ -3138,7 +3138,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=Path(
-            "data/.external_supervision/strong_teacher/refinement"
+            "data/upstream/external_supervision/strong_teacher/refinement"
         ),
     )
     build.set_defaults(func=build_refinement)

@@ -40,8 +40,8 @@ V1_STATE_PATH = Path("data/.build/unified_swe_v1.sqlite3")
 WORKING_STATE_PATH = V1_STATE_PATH
 POLICY_FTS_PATH = Path("data/.build/retriever_v2_2_fts.sqlite3")
 V1_RELEASE_ROOT = Path("data/unified_swe_dataset_v1")
-V2_STAGING_ROOT = Path("data/unified_swe_dataset_v2_10.tmp")
-V2_RELEASE_ROOT = Path("data/unified_swe_dataset_v2_10")
+V2_STAGING_ROOT = Path("data/upstream/unified_swe_dataset_v2_10.tmp")
+V2_RELEASE_ROOT = Path("data/upstream/unified_swe_dataset_v2_10")
 
 RELEASE_FILES = (
     "train_v2_10.parquet",
@@ -3693,7 +3693,7 @@ def validate_frozen_sources(raw_root: Path) -> dict[str, str]:
                     f"来源文件哈希不匹配：{path}，actual={actual_sha256}，"
                     f"expected={expected_sha256}"
                 )
-            manifest_path = f"data/raw/{dataset}/{relative_name}"
+            manifest_path = f"data/upstream/raw/{dataset}/{relative_name}"
             digest.update(manifest_path.encode("utf-8"))
             digest.update(b"\0")
             digest.update(actual_sha256.encode("ascii"))
@@ -8529,7 +8529,7 @@ def audit_policy_state(
 def build_policy_state(
     state_path: Path,
     *,
-    repo_cache_root: Path = Path("data/cache/repos"),
+    repo_cache_root: Path = Path("data/upstream/cache/repos"),
     tokenizer: Any | None = None,
     max_new_tasks: int | None = None,
 ) -> dict[str, Any]:
@@ -8961,8 +8961,8 @@ def apply_v2_release_metadata(record: dict[str, Any]) -> None:
 def run_cli(
     argv: Sequence[str] | None = None,
     *,
-    raw_root: Path = Path("data/raw"),
-    repo_cache_root: Path = Path("data/cache/repos"),
+    raw_root: Path = Path("data/upstream/raw"),
+    repo_cache_root: Path = Path("data/upstream/cache/repos"),
     state_path: Path = WORKING_STATE_PATH,
     expected_raw_counts: dict[str, int] | None = EXPECTED_RAW_SWEBENCH_COUNTS,
     output: Any = sys.stdout,
@@ -10392,7 +10392,7 @@ class SourceNormalizationTests(unittest.TestCase):
                     {
                         "fixture": "sha256:"
                         + hashlib.sha256(
-                            b"data/raw/fixture/source.bin\0"
+                            b"data/upstream/raw/fixture/source.bin\0"
                             + expected_hash.encode("ascii")
                             + b"\n"
                         ).hexdigest()

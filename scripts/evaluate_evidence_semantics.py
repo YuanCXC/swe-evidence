@@ -286,7 +286,7 @@ SemanticEvidencePackage.agent_declared_stop 默认保持 None。
 第一步，本机做 audit：
 
     python scripts/evaluate_evidence_semantics.py `
-      --dataset-dir data/unified_swe_dataset_v2_10 `
+      --dataset-dir data/upstream/unified_swe_dataset_v2_10 `
       --evidence-cache data/.train_cache/policy_evidence_v2_10.sqlite3 `
       --split validation `
       --mode audit `
@@ -295,7 +295,7 @@ SemanticEvidencePackage.agent_declared_stop 默认保持 None。
 第二步，导出 Judge 请求：
 
     python scripts/evaluate_evidence_semantics.py `
-      --dataset-dir data/unified_swe_dataset_v2_10 `
+      --dataset-dir data/upstream/unified_swe_dataset_v2_10 `
       --evidence-cache data/.train_cache/policy_evidence_v2_10.sqlite3 `
       --split validation `
       --mode export `
@@ -304,7 +304,7 @@ SemanticEvidencePackage.agent_declared_stop 默认保持 None。
 第三步，开发期可做 mock smoke：
 
     python scripts/evaluate_evidence_semantics.py `
-      --dataset-dir data/unified_swe_dataset_v2_10 `
+      --dataset-dir data/upstream/unified_swe_dataset_v2_10 `
       --evidence-cache data/.train_cache/policy_evidence_v2_10.sqlite3 `
       --split validation `
       --mode mock `
@@ -394,7 +394,7 @@ except ImportError as exc:
 DATASET_VERSION = "2.10.0"
 
 DEFAULT_DATASET_DIR = Path(
-    "data/unified_swe_dataset_v2_10"
+    "data/upstream/unified_swe_dataset_v2_10"
 )
 
 DEFAULT_EVIDENCE_CACHE = Path(

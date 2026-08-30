@@ -178,7 +178,7 @@ except ImportError as exc:
 DATASET_VERSION = "2.10.0"
 
 DEFAULT_DATASET_DIR = Path(
-    "data/unified_swe_dataset_v2_10"
+    "data/upstream/unified_swe_dataset_v2_10"
 )
 
 DEFAULT_EVIDENCE_CACHE = Path(

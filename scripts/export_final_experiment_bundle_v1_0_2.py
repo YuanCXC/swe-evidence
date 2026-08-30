@@ -1310,13 +1310,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--derived-dir",
         type=Path,
-        default=Path("data/unified_swe_dataset_v2_10_teacher_v1"),
+        default=Path("data/upstream/unified_swe_dataset_v2_10_teacher_v1"),
         help="Audited Strong-Teacher derived dataset directory.",
     )
     p.add_argument(
         "--base-dir",
         type=Path,
-        default=Path("data/unified_swe_dataset_v2_10"),
+        default=Path("data/upstream/unified_swe_dataset_v2_10"),
         help="Frozen V2.10 base release directory.",
     )
     p.add_argument(

@@ -40,12 +40,12 @@ PowerShell：
 
     # 先检查，不写盘
     python scripts/refresh_strong_teacher_md_v1_5_cache_first.py `
-      --root data/.external_supervision/strong_teacher_v1_3_all `
+      --root data/upstream/external_supervision/strong_teacher_v1_3_all `
       --dry-run
 
     # 正式修改
     python scripts/refresh_strong_teacher_md_v1_5_cache_first.py `
-      --root data/.external_supervision/strong_teacher_v1_3_all
+      --root data/upstream/external_supervision/strong_teacher_v1_3_all
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ except ImportError as exc:
 SCRIPT_VERSION = "1.5.0"
 PROMPT_CONTRACT_VERSION = "cache-first-single-task-v1.5"
 
-DEFAULT_ROOT = Path("data/.external_supervision/strong_teacher_v1_3_all")
+DEFAULT_ROOT = Path("data/upstream/external_supervision/strong_teacher_v1_3_all")
 DEFAULT_SPLITS = ("train", "validation", "benchmark")
 
 PROTOCOL_MARKER = "[UNIFIED STRONG-TEACHER PROTOCOL]"
@@ -337,7 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--root",
         type=Path,
         default=DEFAULT_ROOT,
-        help="默认 data/.external_supervision/strong_teacher_v1_3_all",
+        help="默认 data/upstream/external_supervision/strong_teacher_v1_3_all",
     )
     parser.add_argument(
         "--splits",
